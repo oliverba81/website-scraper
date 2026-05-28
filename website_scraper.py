@@ -194,7 +194,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox,
     QProgressBar, QTextEdit, QFileDialog, QTabWidget, QFrame,
     QSizePolicy, QGroupBox, QSpinBox, QDialog, QDialogButtonBox,
-    QFormLayout, QMessageBox, QScrollArea,
+    QFormLayout, QMessageBox, QScrollArea, QStyle,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QFont, QTextCursor
@@ -1288,9 +1288,11 @@ class PathInputRow(QWidget):
         self.edit.setPlaceholderText(placeholder)
         lay.addWidget(self.edit)
         if browse:
-            btn = QPushButton("📁")
+            btn = QPushButton()
             btn.setObjectName("secondary")
             btn.setFixedSize(QSize(38, 34))
+            btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
+            btn.setIconSize(QSize(18, 18))
             btn.setToolTip("Verzeichnis wählen")
             btn.clicked.connect(self._browse)
             lay.addWidget(btn)
