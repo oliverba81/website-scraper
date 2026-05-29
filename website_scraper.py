@@ -26,7 +26,7 @@ from xml.etree import ElementTree as ET
 # ─── Konstanten ──────────────────────────────────────────────────────────────
 
 APP_NAME    = "website_scraper"
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.10"
 SETTINGS_FILE = Path.home() / f".{APP_NAME}_settings.json"
 
 GITHUB_REPO     = "oliverba81/website-scraper"
@@ -1639,9 +1639,10 @@ if __name__ == "__main__":
             tabs = ctk.CTkTabview(self, height=350)
             tabs.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
-            ai      = tabs.add("🤖  KI & API")
-            sc      = tabs.add("🔧  Scraper")
-            fmt_tab = tabs.add("📋  Formate")
+            ai       = tabs.add("🤖  KI & API")
+            sc       = tabs.add("🔧  Scraper")
+            fmt_tab  = tabs.add("📋  Formate")
+            clog_tab = tabs.add("📰  Changelog")
 
             # ── KI-Tab ────────────────────────────────────────────────────────
             ai.columnconfigure(1, weight=1)
@@ -1741,6 +1742,7 @@ if __name__ == "__main__":
             ).pack(side="left")
 
             self._build_formats_tab(fmt_tab)
+            self._build_changelog_tab(clog_tab)
 
             # ── Buttons ───────────────────────────────────────────────────────
             btn_row = ctk.CTkFrame(self, fg_color="transparent")
@@ -1894,6 +1896,99 @@ if __name__ == "__main__":
                     s["active_format"] = "builtin_md"
                 save_settings(s)
                 self._reload_formats_tab()
+
+        # ── Changelog-Tab ─────────────────────────────────────────────────────
+
+        def _build_changelog_tab(self, frame):
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(1, weight=1)
+
+            # Header-Zeile mit Status + Aktualisieren-Button
+            hdr = ctk.CTkFrame(frame, fg_color="transparent")
+            hdr.grid(row=0, column=0, sticky="ew", padx=8, pady=(10, 4))
+            hdr.columnconfigure(0, weight=1)
+            self._clog_status = tk.StringVar(value="Lade Changelog…")
+            ctk.CTkLabel(
+                hdr, textvariable=self._clog_status,
+                font=ctk.CTkFont(size=11), text_color="gray55", anchor="w",
+            ).grid(row=0, column=0, sticky="w")
+            ctk.CTkButton(
+                hdr, text="↻  Aktualisieren",
+                width=120, height=26,
+                fg_color="transparent", border_width=1,
+                text_color=("gray10", "gray90"),
+                command=lambda: threading.Thread(
+                    target=self._fetch_changelog, daemon=True).start(),
+            ).grid(row=0, column=1, sticky="e")
+
+            # Textbox für Release-Notes
+            self._clog_box = ctk.CTkTextbox(
+                frame,
+                font=ctk.CTkFont(family="Segoe UI", size=12),
+                fg_color=("gray96", "#141420"),
+                text_color=("gray10", "#d4d4d4"),
+                corner_radius=6,
+                state="disabled",
+            )
+            self._clog_box.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+            # Sofort laden
+            threading.Thread(target=self._fetch_changelog, daemon=True).start()
+
+        def _fetch_changelog(self):
+            """Lädt die letzten 10 Releases von GitHub (Hintergrund-Thread)."""
+            import urllib.request as _ureq
+            try:
+                self.after(0, self._clog_status.set, "Lade Changelog…")
+                headers = {
+                    "Accept":     "application/vnd.github.v3+json",
+                    "User-Agent": f"website-scraper/{APP_VERSION}",
+                }
+                token = get_api_key("github") or GITHUB_UPDATE_TOKEN
+                if token:
+                    headers["Authorization"] = f"token {token}"
+                req = _ureq.Request(
+                    f"{GITHUB_API_BASE}/releases?per_page=10",
+                    headers=headers,
+                )
+                with _ureq.urlopen(req, timeout=10) as resp:
+                    releases = json.loads(resp.read())
+                self.after(0, self._render_changelog, releases)
+            except Exception as exc:
+                self.after(0, self._clog_status.set, f"Fehler: {exc}")
+
+        def _render_changelog(self, releases: list):
+            lines = []
+            for r in releases:
+                tag    = r.get("tag_name", "")
+                name   = r.get("name", tag)
+                body   = (r.get("body") or "").strip()
+                pub    = r.get("published_at", "")[:10]  # YYYY-MM-DD
+                # Datum DE-Format
+                try:
+                    from datetime import datetime
+                    pub = datetime.strptime(pub, "%Y-%m-%d").strftime("%d.%m.%Y")
+                except Exception:
+                    pass
+                lines.append(f"{'─' * 52}")
+                lines.append(f"  {name}   ({pub})")
+                lines.append(f"{'─' * 52}")
+                if body:
+                    for line in body.splitlines():
+                        lines.append(f"  {line}")
+                else:
+                    lines.append("  (keine Beschreibung)")
+                lines.append("")
+
+            text = "\n".join(lines)
+            self._clog_box.configure(state="normal")
+            self._clog_box.delete("1.0", tk.END)
+            self._clog_box.insert("1.0", text)
+            self._clog_box.configure(state="disabled")
+            self._clog_status.set(
+                f"{len(releases)} Releases  ·  aktuellste: "
+                f"{releases[0].get('tag_name','') if releases else '–'}"
+            )
 
     # ── Statistik-Dialog ──────────────────────────────────────────────────────
 
