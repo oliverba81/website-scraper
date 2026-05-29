@@ -1958,27 +1958,31 @@ if __name__ == "__main__":
                 self.after(0, self._clog_status.set, f"Fehler: {exc}")
 
         def _render_changelog(self, releases: list):
+            _SKIP = {"## What's Changed", "## New Contributors"}
             lines = []
             for r in releases:
-                tag    = r.get("tag_name", "")
-                name   = r.get("name", tag)
-                body   = (r.get("body") or "").strip()
-                pub    = r.get("published_at", "")[:10]  # YYYY-MM-DD
-                # Datum DE-Format
+                tag  = r.get("tag_name", "")
+                name = r.get("name", tag)
+                body = (r.get("body") or "").strip()
+                pub  = r.get("published_at", "")[:10]
                 try:
                     from datetime import datetime
                     pub = datetime.strptime(pub, "%Y-%m-%d").strftime("%d.%m.%Y")
                 except Exception:
                     pass
-                lines.append(f"{'─' * 52}")
-                lines.append(f"  {name}   ({pub})")
-                lines.append(f"{'─' * 52}")
+                if lines:
+                    lines.append("")
+                lines.append(f"  {name}  ·  {pub}")
+                lines.append("  " + "─" * 28)
                 if body:
                     for line in body.splitlines():
+                        if line.strip() in _SKIP:
+                            continue
+                        if line.startswith("**Full Changelog**"):
+                            continue
                         lines.append(f"  {line}")
                 else:
                     lines.append("  (keine Beschreibung)")
-                lines.append("")
 
             text = "\n".join(lines)
             self._clog_box.configure(state="normal")
