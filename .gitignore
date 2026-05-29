@@ -12,3 +12,6 @@ __pycache__/
 
 # Lokale Einstellungen (werden in ~ gespeichert, nicht im Repo)
 .env
+
+# IDE / Tool-Konfiguration (lokal, nicht ins Repo)
+.claude/

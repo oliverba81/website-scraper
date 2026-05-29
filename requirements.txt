@@ -1,0 +1,9 @@
+playwright
+beautifulsoup4
+lxml
+requests
+openai
+google-genai
+keyring
+keyrings.alt
+customtkinter
