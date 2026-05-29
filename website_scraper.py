@@ -277,17 +277,19 @@ def _version_tuple(v: str) -> tuple:
         return (0, 0, 0)
 
 
-def _check_for_update(token: str):
+def _check_for_update(token: str = ""):
     """
     Prüft GitHub Releases auf eine neuere Version.
     Gibt (version_str, asset_url) zurück oder None.
+    Token ist optional – bei öffentlichen Repos nicht nötig.
     """
     import urllib.request as _ureq
     headers = {
-        "Authorization": f"token {token}",
-        "Accept":        "application/vnd.github.v3+json",
-        "User-Agent":    f"website-scraper/{APP_VERSION}",
+        "Accept":     "application/vnd.github.v3+json",
+        "User-Agent": f"website-scraper/{APP_VERSION}",
     }
+    if token:
+        headers["Authorization"] = f"token {token}"
     req = _ureq.Request(f"{GITHUB_API_BASE}/releases/latest", headers=headers)
     with _ureq.urlopen(req, timeout=8) as resp:
         data = json.loads(resp.read())
@@ -2287,10 +2289,8 @@ if __name__ == "__main__":
 
         def _check_update(self):
             """Startet den Update-Check im Hintergrund (kein UI-Block)."""
-            # Eingetragener Token hat Vorrang; sonst eingebetteter Fallback-Token
+            # Token optional – bei public Repo nicht nötig; private Repo braucht ihn
             token = get_api_key("github") or GITHUB_UPDATE_TOKEN
-            if not token:
-                return
             threading.Thread(target=self._check_update_bg,
                              args=(token,), daemon=True).start()
 
