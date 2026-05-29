@@ -296,8 +296,10 @@ def _check_for_update(token: str = ""):
     latest_tag = data.get("tag_name", "")
     latest_ver = latest_tag.lstrip("v")
     if _version_tuple(latest_ver) > _version_tuple(APP_VERSION):
+        # browser_download_url ist bei public repos ohne Token zugänglich
+        # (a["url"] = API-Endpunkt, der auch bei public repos 401 liefert)
         asset_url = next(
-            (a["url"] for a in data.get("assets", [])
+            (a["browser_download_url"] for a in data.get("assets", [])
              if a["name"] == "website_scraper.py"),
             None,
         )
