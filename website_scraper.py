@@ -25,9 +25,12 @@ from xml.etree import ElementTree as ET
 
 # ─── Konstanten ──────────────────────────────────────────────────────────────
 
-APP_NAME = "website_scraper"
+APP_NAME    = "website_scraper"
 APP_VERSION = "1.0.0"
 SETTINGS_FILE = Path.home() / f".{APP_NAME}_settings.json"
+
+GITHUB_REPO     = "oliverba81/website-scraper"
+GITHUB_API_BASE = f"https://api.github.com/repos/{GITHUB_REPO}"
 
 # ── Menschliche Zeitschätzung ────────────────────────────────────────────────
 HUMAN_MIN_BASE          = 3.0   # Basis: Navigation + Datei anlegen + Überblick
@@ -257,6 +260,59 @@ def _apply_template(template: str, data: dict) -> str:
     for k, v in data.items():
         result = result.replace("{{" + k + "}}", str(v))
     return result
+
+
+def _version_tuple(v: str) -> tuple:
+    """Konvertiert '1.2.3' → (1, 2, 3) für korrekten Versionsvergleich."""
+    try:
+        return tuple(int(x) for x in v.strip().lstrip("v").split("."))
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+
+
+def _check_for_update(token: str):
+    """
+    Prüft GitHub Releases auf eine neuere Version.
+    Gibt (version_str, asset_url) zurück oder None.
+    """
+    import urllib.request as _ureq
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept":        "application/vnd.github.v3+json",
+        "User-Agent":    f"website-scraper/{APP_VERSION}",
+    }
+    req = _ureq.Request(f"{GITHUB_API_BASE}/releases/latest", headers=headers)
+    with _ureq.urlopen(req, timeout=8) as resp:
+        data = json.loads(resp.read())
+    latest_tag = data.get("tag_name", "")
+    latest_ver = latest_tag.lstrip("v")
+    if _version_tuple(latest_ver) > _version_tuple(APP_VERSION):
+        asset_url = next(
+            (a["url"] for a in data.get("assets", [])
+             if a["name"] == "website_scraper.py"),
+            None,
+        )
+        if asset_url is None:
+            return None  # Release ohne Asset → kein automatisches Update möglich
+        return latest_ver, asset_url
+    return None
+
+
+def _download_update(token: str, asset_url: str) -> bytes:
+    """
+    Lädt das Update-Asset von GitHub herunter.
+    requests (in requirements.txt) entfernt den Authorization-Header beim
+    Redirect zu S3 automatisch (cross-domain redirect stripping).
+    """
+    import requests as _req
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept":        "application/octet-stream",
+        "User-Agent":    f"website-scraper/{APP_VERSION}",
+    }
+    resp = _req.get(asset_url, headers=headers, timeout=60)
+    resp.raise_for_status()
+    return resp.content
 
 
 # ─── API-Key-Verwaltung (keyring + Fallback) ──────────────────────────────────
@@ -1600,7 +1656,30 @@ if __name__ == "__main__":
                          font=ctk.CTkFont(size=11)).pack(side="left")
 
             ctk.CTkFrame(sc, height=1, fg_color="gray35").pack(
-                fill="x", padx=8, pady=(18, 14))
+                fill="x", padx=8, pady=(18, 10))
+
+            # ── GitHub Update-Token ───────────────────────────────────────────
+            ctk.CTkLabel(sc, text="GitHub Update-Token",
+                         font=ctk.CTkFont(weight="bold"), anchor="w").pack(
+                anchor="w", padx=8, pady=(0, 2))
+            self._gh_token_var = tk.StringVar()
+            gh_e = ctk.CTkEntry(sc, textvariable=self._gh_token_var,
+                                show="*", width=390)
+            gh_e.pack(anchor="w", padx=8)
+            self._gh_show = tk.BooleanVar()
+            ctk.CTkCheckBox(
+                sc, text="Token anzeigen", variable=self._gh_show,
+                command=lambda: gh_e.configure(
+                    show="" if self._gh_show.get() else "*"),
+            ).pack(anchor="w", padx=8, pady=(4, 0))
+            ctk.CTkLabel(
+                sc,
+                text="Fine-grained PAT: Repository-Permission 'Contents: Read-only' genügt",
+                font=ctk.CTkFont(size=10), text_color="gray55", anchor="w",
+            ).pack(anchor="w", padx=8, pady=(2, 0))
+
+            ctk.CTkFrame(sc, height=1, fg_color="gray35").pack(
+                fill="x", padx=8, pady=(14, 14))
 
             appear_row = ctk.CTkFrame(sc, fg_color="transparent")
             appear_row.pack(anchor="w", padx=8, pady=(0, 8))
@@ -1635,6 +1714,7 @@ if __name__ == "__main__":
             self._desc_var.set(s.get("describe_images", True))
             self._headless_var.set(s.get("headless", True))
             self._max_var.set(s.get("max_images", 30))
+            self._gh_token_var.set(get_api_key("github"))
             # Erscheinungsbild: intern "dark"/"light"/"system" → Label mit Emoji
             _mode_to_label = {"dark": "🌙  Dark", "light": "☀️  Light", "system": "🖥  System"}
             self._appear_var.set(_mode_to_label.get(s.get("appearance", "dark"), "🌙  Dark"))
@@ -1659,10 +1739,13 @@ if __name__ == "__main__":
             save_settings(s)
             oai = self._oai_var.get().strip()
             gem = self._gem_var.get().strip()
+            gh  = self._gh_token_var.get().strip()
             if oai:
                 set_api_key("openai", oai)
             if gem:
                 set_api_key("gemini", gem)
+            if gh:
+                set_api_key("github", gh)
             # Modus sofort anwenden (kein Neustart nötig)
             ctk.set_appearance_mode(appearance)
             messagebox.showinfo("Einstellungen", "Gespeichert.", parent=self)
@@ -1895,6 +1978,8 @@ if __name__ == "__main__":
             self._running = False
             self._build_ui()
             self._load_session()
+            # Update-Check nach 3 Sek. (nach vollständigem Fensteraufbau)
+            self.after(3000, self._check_update)
 
         def _build_ui(self):
             self.columnconfigure(0, weight=1)
@@ -2163,6 +2248,65 @@ if __name__ == "__main__":
 
         def _open_stats(self):
             StatsDialog(self)
+
+        # ── Update-Check ──────────────────────────────────────────────────────
+
+        def _check_update(self):
+            """Startet den Update-Check im Hintergrund (kein UI-Block)."""
+            token = get_api_key("github")
+            if not token:
+                return
+            threading.Thread(target=self._check_update_bg,
+                             args=(token,), daemon=True).start()
+
+        def _check_update_bg(self, token: str):
+            try:
+                result = _check_for_update(token)
+                if result:
+                    self.after(0, self._offer_update, *result)
+            except Exception:
+                pass  # Kein Netz, kein Token, kein Release → still ignorieren
+
+        def _offer_update(self, new_ver: str, asset_url: str):
+            if self._running:
+                return  # Kein Update während einer laufenden Extraktion
+            if messagebox.askyesno(
+                "Update verfügbar",
+                f"Version {new_ver} ist verfügbar  (aktuell: {APP_VERSION})\n\n"
+                "Die App wird aktualisiert, kurz neu gestartet und ist dann\n"
+                "sofort einsatzbereit. Jetzt aktualisieren?",
+            ):
+                self._run_update(new_ver, asset_url)
+
+        def _run_update(self, new_ver: str, asset_url: str):
+            token = get_api_key("github")
+            try:
+                self._status_var.set(f"Lade Version {new_ver} herunter…")
+                self.update_idletasks()
+                data    = _download_update(token, asset_url)
+                script  = Path(__file__).resolve()
+                tmp     = script.with_name("website_scraper.new.py")
+                updater = script.with_name("_ws_updater.py")
+                tmp.write_bytes(data)
+                # repr(str(...)) macht Pfade mit Leerzeichen + Sonderzeichen sicher
+                updater.write_text(
+                    "import time, sys, subprocess\n"
+                    "from pathlib import Path\n"
+                    "time.sleep(2)\n"
+                    f"Path({repr(str(tmp))}).replace(Path({repr(str(script))}))\n"
+                    f"subprocess.Popen([sys.executable, {repr(str(script))}])\n"
+                    f"Path({repr(str(updater))}).unlink(missing_ok=True)\n",
+                    encoding="utf-8",
+                )
+                # pythonw.exe → kein Konsolenfenster; DETACHED → unabhängig vom Parent
+                pythonw = Path(sys.executable).with_name("pythonw.exe")
+                interp  = str(pythonw) if pythonw.exists() else sys.executable
+                flags   = (getattr(subprocess, "DETACHED_PROCESS", 0) |
+                           getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                subprocess.Popen([interp, str(updater)], creationflags=flags)
+                self.destroy()
+            except Exception as exc:
+                messagebox.showerror("Update fehlgeschlagen", str(exc))
 
         def _show_savings(self, human_min: float, tool_secs: float):
             tool_min = tool_secs / 60
