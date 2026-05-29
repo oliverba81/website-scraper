@@ -1,0 +1,11 @@
+# Auto-Updater temporäre Dateien
+website_scraper.new.py
+_ws_updater.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Lokale Einstellungen (werden in ~ gespeichert, nicht im Repo)
+.env

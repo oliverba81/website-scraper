@@ -1,1817 +1,2650 @@
 #!/usr/bin/env python3
 """
-website_scraper.py — Website-Scraper Desktop-App (PyQt6, Dark Mode)
-
-Framework-Wahl: PyQt6
-  PyQt6 bietet native Windows-Integration, exzellente Dark-Mode-Unterstützung
-  via QSS-Stylesheets, einen robusten Signal/Slot-Mechanismus für vollständig
-  thread-sichere UI-Updates und eine ausgereifte Widget-Bibliothek für
-  professionelle Desktop-Apps. Im Gegensatz zu CustomTkinter (tkinter-basiert,
-  gemäß Spec ausgeschlossen) und PySide6 liefert PyQt6 die stabilste,
-  bestdokumentierte Basis für eine eigenständige Windows-Anwendung.
+Website Scraper → Markdown
+Extrahiert komplette Webseiten als strukturierte Markdown-Dateien.
+Bilder werden per OpenAI GPT-4o oder Google Gemini detailliert beschrieben.
+Unterstützt Einzel-URLs und XML-Sitemaps (inkl. Sitemap-Index, .gz).
 """
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 0 — BOOTSTRAP: Auto-Install fehlender Abhängigkeiten
-# ══════════════════════════════════════════════════════════════════════════════
-
 import sys
+import os
+import re
+import json
+import gzip
+import base64
+import random
+import threading
 import subprocess
 import importlib
-import site
-import os
-import json
+import time
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
+from xml.etree import ElementTree as ET
 
-SETUP_VERSION = "1.1"
-SETTINGS_FILE = Path.home() / ".website_scraper_settings.json"
+# ─── Konstanten ──────────────────────────────────────────────────────────────
 
-REQUIRED_PACKAGES: dict[str, str] = {
-    "PyQt6":        "PyQt6",
-    "bs4":          "beautifulsoup4",
-    "lxml":         "lxml",
-    "playwright":   "playwright",
-    "openai":       "openai",
-    "google":       "google-genai",
-    "keyring":      "keyring",
-    "keyrings":     "keyrings.alt",
+APP_NAME    = "website_scraper"
+APP_VERSION = "1.0.0"
+SETTINGS_FILE = Path.home() / f".{APP_NAME}_settings.json"
+
+GITHUB_REPO     = "oliverba81/website-scraper"
+GITHUB_API_BASE = f"https://api.github.com/repos/{GITHUB_REPO}"
+
+# ── Menschliche Zeitschätzung ────────────────────────────────────────────────
+HUMAN_MIN_BASE          = 3.0   # Basis: Navigation + Datei anlegen + Überblick
+HUMAN_MIN_PER_100_WORDS = 1.0   # Copy-Paste + Markdown-Formatierung (keine KI-Texte)
+HUMAN_MIN_PER_IMAGE     = 2.5   # Snipping-Tool + Datei einfügen + kurze Beschreibung
+HUMAN_MIN_MIN_PER_PAGE  = 2.0   # Minimum pro Seite
+MAX_RUNS_HISTORY        = 1000  # Maximale Anzahl gespeicherter Läufe
+
+# ── Ausgabeformate ────────────────────────────────────────────────────────────
+DEFAULT_XML_TEMPLATE = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<page>\n'
+    '  <title>{{title}}</title>\n'
+    '  <url>{{url}}</url>\n'
+    '  <content><![CDATA[{{content}}]]></content>\n'
+    '</page>'
+)
+DEFAULT_CSV_FIELDS = ["title", "url", "content"]
+ALL_FORMAT_FIELDS  = [
+    "title", "url", "content", "text",
+    "meta_description", "date", "images_count",
+]
+
+REQUIRED_PACKAGES = {
+    "playwright": "playwright",
+    "bs4": "beautifulsoup4",
+    "lxml": "lxml",
+    "openai": "openai",
+    "google.genai": "google-genai",
+    "keyring": "keyring",
+    "keyrings.alt": "keyrings.alt",
+    "customtkinter": "customtkinter",
 }
 
-
-def _refresh_sys_path() -> None:
-    try:
-        user_site = site.getusersitepackages()
-        if user_site and user_site not in sys.path:
-            sys.path.append(user_site)
-    except Exception:
-        pass
-    try:
-        for p in site.getsitepackages():
-            if p and p not in sys.path:
-                sys.path.append(p)
-    except Exception:
-        pass
+SUPPORTED_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
 
-def _missing_packages() -> list[str]:
+# ─── Abhängigkeiten ──────────────────────────────────────────────────────────
+
+def _check_missing():
     missing = []
-    for import_name, pip_name in REQUIRED_PACKAGES.items():
+    for mod_name, pkg_name in REQUIRED_PACKAGES.items():
         try:
-            importlib.import_module(import_name)
+            importlib.import_module(mod_name)
         except ImportError:
-            missing.append(pip_name)
+            missing.append(pkg_name)
     return missing
 
 
-def _pip_install(packages: list[str]) -> None:
-    for pkg in packages:
-        print(f"[Setup] pip install {pkg} …", flush=True)
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet", pkg],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    _refresh_sys_path()
-
-
-def _playwright_install_chromium() -> None:
-    print("[Setup] playwright install chromium …", flush=True)
-    subprocess.check_call(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def _load_raw_settings() -> dict:
+def _playwright_browsers_ok():
     try:
-        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        cache = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ms-playwright"
+        return bool(list(cache.glob("chromium-*")))
     except Exception:
-        return {}
+        return False
 
 
-def _save_raw_settings(data: dict) -> None:
+def _refresh_sys_path():
+    """Fügt user site-packages zu sys.path hinzu (nach pip install nötig)."""
+    import site
+    importlib.invalidate_caches()
     try:
-        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        user_site = site.getusersitepackages()
+        if user_site not in sys.path:
+            sys.path.insert(0, user_site)
+    except Exception:
+        pass
+    try:
+        import sysconfig
+        purelib = sysconfig.get_paths().get("purelib", "")
+        if purelib and purelib not in sys.path:
+            sys.path.insert(0, purelib)
     except Exception:
         pass
 
 
-# ── Determine whether setup is needed ───────────────────────────────────────
-_raw_cfg = _load_raw_settings()
-_setup_done = (
-    _raw_cfg.get("setup_done") is True
-    and _raw_cfg.get("setup_version") == SETUP_VERSION
-)
+def ensure_dependencies():
+    """Prüft und installiert fehlende Pakete beim ersten Start."""
+    settings = load_settings()
 
-_missing = _missing_packages()
-if _missing:
-    _setup_done = False
-
-if not _setup_done:
-    # Phase 1: install Python packages (console-based, no Qt yet)
-    if _missing:
-        print(f"[Setup] Installiere fehlende Pakete: {_missing}", flush=True)
-        _pip_install(_missing)
+    if settings.get("setup_done") and settings.get("setup_version") == APP_VERSION:
         _refresh_sys_path()
+        still_missing = _check_missing()
+        if not still_missing:
+            return
+        settings.pop("setup_done", None)
+        save_settings(settings)
 
-    # Phase 2: install playwright chromium
-    # Use Qt dialog if PyQt6 is now available
-    try:
-        from PyQt6.QtWidgets import QApplication, QDialog, QVBoxLayout, QLabel, QProgressBar
-        from PyQt6.QtCore import Qt as _Qt
+    missing = _check_missing()
+    browsers_needed = not _playwright_browsers_ok()
 
-        _app_setup = QApplication.instance() or QApplication(sys.argv)
-        _setup_style = (
-            "QWidget{background:#1e1e2e;color:#cdd6f4;font-family:'Segoe UI';font-size:13px;}"
-            "QProgressBar{border:1px solid #45475a;border-radius:5px;background:#313244;min-height:20px;}"
-            "QProgressBar::chunk{background:#89b4fa;border-radius:4px;}"
-        )
+    if not missing and not browsers_needed:
+        _mark_setup_done()
+        return
 
-        class _SetupDlg(QDialog):
-            def __init__(self) -> None:
-                super().__init__()
-                self.setWindowTitle("Website Scraper — Ersteinrichtung")
-                self.setFixedSize(480, 140)
-                self.setStyleSheet(_setup_style)
-                lay = QVBoxLayout(self)
-                self._lbl = QLabel("Installiere Playwright Chromium …")
-                self._lbl.setAlignment(_Qt.AlignmentFlag.AlignCenter)
-                self._bar = QProgressBar()
-                self._bar.setRange(0, 100)
-                self._bar.setValue(0)
-                lay.addWidget(self._lbl)
-                lay.addWidget(self._bar)
+    root = tk.Tk()
+    root.title("Erstmaliges Setup – Website Scraper")
+    root.geometry("500x240")
+    root.resizable(False, False)
+    root.lift()
+    root.focus_force()
 
-            def tick(self, msg: str, pct: int) -> None:
-                self._lbl.setText(msg)
-                self._bar.setValue(pct)
-                _app_setup.processEvents()
+    frm = ttk.Frame(root, padding=20)
+    frm.pack(fill="both", expand=True)
 
-        _dlg = _SetupDlg()
-        _dlg.show()
-        _dlg.tick("Installiere Playwright Chromium …", 20)
-        _playwright_install_chromium()
-        _dlg.tick("Einrichtung abgeschlossen!", 100)
-        import time as _t; _t.sleep(1)
-        _dlg.close()
+    ttk.Label(frm, text="Installiere benötigte Pakete…",
+              font=("Segoe UI", 11)).pack(anchor="w")
 
-    except Exception:
-        _playwright_install_chromium()
+    prog = ttk.Progressbar(frm, length=460, mode="indeterminate")
+    prog.pack(pady=10)
+    prog.start(15)
 
-    _raw_cfg["setup_done"] = True
-    _raw_cfg["setup_version"] = SETUP_VERSION
-    _save_raw_settings(_raw_cfg)
+    status_var = tk.StringVar(value="Vorbereitung…")
+    ttk.Label(frm, textvariable=status_var, foreground="#555",
+              wraplength=460).pack(anchor="w")
 
-else:
-    # Always verify playwright chromium still works
-    try:
-        from playwright.sync_api import sync_playwright as _spw
-        with _spw() as _pw:
-            _b = _pw.chromium.launch(headless=True)
-            _b.close()
-    except Exception:
-        _playwright_install_chromium()
+    note = ttk.Label(frm,
+                     text="(Chromium-Download ca. 150 MB – nur einmalig)",
+                     foreground="#888", font=("Segoe UI", 8))
+    note.pack(anchor="w", pady=(4, 0))
 
+    def _set(msg):
+        root.after(0, lambda: status_var.set(msg))
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — IMPORTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-import gzip
-import base64
-import threading
-import random
-import re
-import time
-import urllib.request
-import urllib.parse
-from xml.etree import ElementTree as ET
-from datetime import datetime
-
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox,
-    QProgressBar, QTextEdit, QFileDialog, QTabWidget, QFrame,
-    QSizePolicy, QGroupBox, QSpinBox, QDialog, QDialogButtonBox,
-    QFormLayout, QMessageBox, QScrollArea, QStyle,
-)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QFont, QTextCursor
-
-from bs4 import BeautifulSoup, NavigableString, Tag
-from playwright.sync_api import sync_playwright
-
-try:
-    import keyring
-    _KEYRING_OK = True
-except ImportError:
-    _KEYRING_OK = False
-
-try:
-    import keyrings.alt  # noqa: F401 — ensure fallback backend is registered
-except ImportError:
-    pass
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — SETTINGS & CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
-
-KEYRING_SERVICE = "website_scraper"
-
-DEFAULT_SETTINGS: dict = {
-    "ai_provider": "openai",
-    "openai_model": "gpt-4o",
-    "gemini_model": "gemini-2.0-flash",
-    "ai_describe_images": False,
-    "browser_headless": True,
-    "max_images_per_page": 30,
-    "last_mode": "single",
-    "single_url": "",
-    "single_output_path": str(Path.home() / "Desktop"),
-    "sitemap_url": "",
-    "sitemap_output_path": str(Path.home() / "Desktop"),
-    "setup_done": True,
-    "setup_version": SETUP_VERSION,
-}
-
-
-class Settings:
-    def __init__(self) -> None:
-        self._data: dict = dict(DEFAULT_SETTINGS)
-        self.load()
-
-    def load(self) -> None:
+    def _install():
         try:
-            stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            self._data.update(stored)
-        except Exception:
-            pass
-
-    def save(self) -> None:
-        try:
-            SETTINGS_FILE.write_text(
-                json.dumps(self._data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
-
-    def get(self, key: str, default=None):
-        fallback = default if default is not None else DEFAULT_SETTINGS.get(key)
-        return self._data.get(key, fallback)
-
-    def set(self, key: str, value) -> None:
-        self._data[key] = value
-
-    def get_api_key(self, provider: str) -> str:
-        if _KEYRING_OK:
-            try:
-                return keyring.get_password(KEYRING_SERVICE, provider) or ""
-            except Exception:
-                pass
-        return self._data.get(f"{provider}_api_key", "")
-
-    def set_api_key(self, provider: str, key: str) -> None:
-        if _KEYRING_OK:
-            try:
-                keyring.set_password(KEYRING_SERVICE, provider, key)
-                return
-            except Exception:
-                pass
-        self._data[f"{provider}_api_key"] = key
-        self.save()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — SITEMAP PARSER
-# ══════════════════════════════════════════════════════════════════════════════
-
-_NS_STRIP = re.compile(r"\{[^}]+\}")
-
-
-def _strip_ns(tag: str) -> str:
-    return _NS_STRIP.sub("", tag)
-
-
-def _fetch_bytes(url: str) -> bytes:
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "WebsiteScraper/1.0"}
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = resp.read()
-    if url.endswith(".gz") or data[:2] == b"\x1f\x8b":
-        data = gzip.decompress(data)
-    return data
-
-
-def parse_sitemap(url: str) -> list[str]:
-    """Recursively resolve sitemap(index) and return all page URLs."""
-    urls: list[str] = []
-    try:
-        data = _fetch_bytes(url)
-        root = ET.fromstring(data)
-        root_tag = _strip_ns(root.tag)
-        if root_tag == "sitemapindex":
-            for elem in root.iter():
-                if _strip_ns(elem.tag) == "loc":
-                    child = (elem.text or "").strip()
-                    if child:
-                        urls.extend(parse_sitemap(child))
-        elif root_tag == "urlset":
-            for elem in root.iter():
-                if _strip_ns(elem.tag) == "loc":
-                    loc = (elem.text or "").strip()
-                    if loc:
-                        urls.append(loc)
-    except Exception as exc:
-        print(f"[Sitemap] Fehler bei {url}: {exc}")
-    return urls
-
-
-def url_to_filename(url: str) -> str:
-    """Convert a URL to a safe .md filename (max 100 chars)."""
-    parsed = urllib.parse.urlparse(url)
-    parts = [p for p in parsed.path.split("/") if p]
-    if parsed.query:
-        parts.append(parsed.query)
-    name = "__".join(parts) if parts else (parsed.netloc or "index")
-    name = re.sub(r"[^\w\-]", "_", name)
-    name = re.sub(r"_+", "_", name).strip("_")
-    if len(name) > 96:
-        name = name[:96]
-    return (name or "index") + ".md"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — HTML → MARKDOWN CONVERTER
-# ══════════════════════════════════════════════════════════════════════════════
-
-_SKIP_TAGS = {"script", "style", "noscript", "svg", "template", "nav", "footer"}
-_ADMONITION_CLASSES = {
-    "note", "tip", "warning", "caution", "danger",
-    "info", "hint", "alert", "callout",
-}
-_CONTENT_RE = re.compile(
-    r"content|main|article|post|entry|body|text|story", re.IGNORECASE
-)
-
-
-def _find_content_root(soup: BeautifulSoup) -> Tag:
-    main = soup.find("main")
-    if main:
-        return main
-    article = soup.find("article")
-    if article:
-        return article
-    for tag in soup.find_all(True):
-        tag_id = tag.get("id", "") or ""
-        tag_cls = " ".join(tag.get("class", []))
-        if _CONTENT_RE.search(tag_id) or _CONTENT_RE.search(tag_cls):
-            return tag
-    return soup.find("body") or soup
-
-
-def _abs_url(href: str, base: str) -> str:
-    if not href:
-        return ""
-    return urllib.parse.urljoin(base, href)
-
-
-def _inline(node: Tag | NavigableString) -> str:
-    """Render a node as inline Markdown text."""
-    if isinstance(node, NavigableString):
-        return str(node)
-    if not isinstance(node, Tag):
-        return ""
-    name = node.name
-    if name in ("strong", "b"):
-        inner = "".join(_inline(c) for c in node.children)
-        return f"**{inner.strip()}**"
-    if name in ("em", "i"):
-        inner = "".join(_inline(c) for c in node.children)
-        return f"*{inner.strip()}*"
-    if name in ("del", "s", "strike"):
-        inner = "".join(_inline(c) for c in node.children)
-        return f"~~{inner.strip()}~~"
-    if name == "code":
-        return f"`{node.get_text()}`"
-    if name == "a":
-        href = node.get("href", "") or ""
-        text = "".join(_inline(c) for c in node.children).strip()
-        return f"[{text}]({href})" if href else text
-    return "".join(_inline(c) for c in node.children)
-
-
-def _convert_list(tag: Tag, depth: int = 0) -> str:
-    lines: list[str] = []
-    ordered = tag.name == "ol"
-    counter = 1
-    for item in tag.find_all("li", recursive=False):
-        indent = "  " * depth
-        prefix = f"{counter}. " if ordered else "- "
-        text_parts: list[str] = []
-        nested_lists: list[Tag] = []
-        for child in item.children:
-            if isinstance(child, NavigableString):
-                text_parts.append(str(child))
-            elif isinstance(child, Tag):
-                if child.name in ("ul", "ol"):
-                    nested_lists.append(child)
-                else:
-                    text_parts.append(_inline(child))
-        line_text = "".join(text_parts).strip()
-        lines.append(f"{indent}{prefix}{line_text}")
-        for nl in nested_lists:
-            lines.append(_convert_list(nl, depth + 1))
-        if ordered:
-            counter += 1
-    return "\n".join(lines)
-
-
-def _convert_table(table: Tag) -> str:
-    rows = table.find_all("tr")
-    if not rows:
-        return ""
-    out: list[str] = []
-    for i, row in enumerate(rows):
-        cells = row.find_all(["th", "td"])
-        out.append("| " + " | ".join(_inline(c) for c in cells) + " |")
-        if i == 0:
-            out.append("| " + " | ".join("---" for _ in cells) + " |")
-    return "\n".join(out)
-
-
-class HtmlToMarkdown:
-    def __init__(self, base_url: str = "") -> None:
-        self.base_url = base_url
-        self.images: list[tuple[str, str]] = []  # (url, label)
-
-    def convert(self, html: str) -> tuple[str, list[tuple[str, str]]]:
-        """Return (markdown, [(img_url, label), ...])."""
-        soup = BeautifulSoup(html, "lxml")
-        for tag in soup.find_all(_SKIP_TAGS):
-            tag.decompose()
-        root = _find_content_root(soup)
-        self.images = []
-        md = self._node(root)
-        md = re.sub(r"\n{3,}", "\n\n", md).strip()
-        return md, self.images
-
-    def _node(self, tag: Tag | NavigableString, depth: int = 0) -> str:
-        if isinstance(tag, NavigableString):
-            text = str(tag)
-            return text if text.strip() else ""
-        if not isinstance(tag, Tag):
-            return ""
-
-        name = tag.name
-        if name in _SKIP_TAGS:
-            return ""
-
-        # ── Headings ──────────────────────────────────────────────────────
-        if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
-            return f"\n{'#' * int(name[1])} {_inline(tag)}\n"
-
-        # ── Paragraph ─────────────────────────────────────────────────────
-        if name == "p":
-            text = _inline(tag)
-            return f"\n{text}\n" if text.strip() else ""
-
-        # ── Lists ─────────────────────────────────────────────────────────
-        if name in ("ul", "ol"):
-            return "\n" + _convert_list(tag) + "\n"
-
-        # ── Table ─────────────────────────────────────────────────────────
-        if name == "table":
-            return "\n" + _convert_table(tag) + "\n"
-
-        # ── Blockquote ────────────────────────────────────────────────────
-        if name == "blockquote":
-            inner = self._children(tag)
-            lines = [f"> {line}" for line in inner.strip().splitlines()]
-            return "\n" + "\n".join(lines) + "\n"
-
-        # ── Code blocks ───────────────────────────────────────────────────
-        if name == "pre":
-            code_tag = tag.find("code")
-            if code_tag:
-                lang = next(
-                    (c[9:] for c in code_tag.get("class", []) if c.startswith("language-")),
-                    "",
+            if missing:
+                _set(f"pip install {' '.join(missing[:4])}{'…' if len(missing) > 4 else ''}")
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
+                    timeout=300,
                 )
-                code = code_tag.get_text()
-            else:
-                lang, code = "", tag.get_text()
-            return f"\n```{lang}\n{code}\n```\n"
+            _refresh_sys_path()
 
-        # ── Inline code (outside pre) ─────────────────────────────────────
-        if name == "code" and (not tag.parent or tag.parent.name != "pre"):
-            return f"`{tag.get_text()}`"
+            if browsers_needed:
+                _set("Installiere Chromium Browser (einmalig ~150 MB)…")
+                subprocess.check_call(
+                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                    timeout=600,
+                )
+            _mark_setup_done()
+            root.after(0, root.destroy)
+        except subprocess.CalledProcessError as exc:
+            def _err():
+                prog.stop()
+                status_var.set(f"FEHLER: {exc}")
+                messagebox.showerror(
+                    "Setup-Fehler",
+                    f"Installation fehlgeschlagen:\n{exc}\n\n"
+                    "Manuell ausführen:\n"
+                    "  pip install -r requirements.txt\n"
+                    "  python -m playwright install chromium",
+                    parent=root,
+                )
+            root.after(0, _err)
 
-        # ── Link ──────────────────────────────────────────────────────────
-        if name == "a":
-            href = _abs_url(tag.get("href", "") or "", self.base_url)
-            text = _inline(tag)
-            return f"[{text}]({href})" if href else text
-
-        # ── Image ─────────────────────────────────────────────────────────
-        if name == "img":
-            src = (
-                tag.get("src")
-                or tag.get("data-src")
-                or tag.get("data-lazy-src")
-                or ""
-            )
-            if not src:
-                for entry in (tag.get("srcset") or "").split(","):
-                    part = entry.strip().split()[0]
-                    if part:
-                        src = part
-                        break
-            src = _abs_url(src, self.base_url)
-            if src and not src.lower().endswith(".svg"):
-                alt = tag.get("alt", "") or src.split("/")[-1] or "Bild"
-                self.images.append((src, alt))
-                return f"\n> 📷 **Screenshot: {alt}**\n> _(Bildbeschreibung folgt)_\n"
-            return ""
-
-        # ── Figure ────────────────────────────────────────────────────────
-        if name == "figure":
-            figcap = tag.find("figcaption")
-            cap_text = figcap.get_text().strip() if figcap else ""
-            if figcap:
-                figcap.decompose()
-            inner = self._children(tag)
-            if cap_text:
-                inner = inner.replace("_(Bildbeschreibung folgt)_", f"_{cap_text}_")
-            return inner
-
-        # ── Details / Summary ─────────────────────────────────────────────
-        if name == "details":
-            summary = tag.find("summary")
-            summary_text = summary.get_text().strip() if summary else "Details"
-            if summary:
-                summary.decompose()
-            inner = self._children(tag)
-            return f"\n**{summary_text}**\n{inner}\n"
-
-        # ── Horizontal rule ───────────────────────────────────────────────
-        if name == "hr":
-            return "\n---\n"
-
-        # ── Inline formatting ─────────────────────────────────────────────
-        if name in ("strong", "b"):
-            return f"**{_inline(tag)}**"
-        if name in ("em", "i"):
-            return f"*{_inline(tag)}*"
-        if name in ("del", "s", "strike"):
-            return f"~~{_inline(tag)}~~"
-
-        # ── iFrame ────────────────────────────────────────────────────────
-        if name == "iframe":
-            src = tag.get("src", "") or ""
-            title = tag.get("title", "Eingebetteter Inhalt")
-            return f"\n[🔗 {title}]({src})\n" if src else ""
-
-        # ── Admonition divs ───────────────────────────────────────────────
-        if name in ("div", "section", "aside"):
-            cls_str = " ".join(tag.get("class", [])).lower()
-            for adm in _ADMONITION_CLASSES:
-                if adm in cls_str:
-                    inner = self._children(tag)
-                    lines = [f"> **{adm.upper()}**"] + [
-                        f"> {line}" for line in inner.strip().splitlines()
-                    ]
-                    return "\n" + "\n".join(lines) + "\n"
-
-        # ── Default: recurse ──────────────────────────────────────────────
-        return self._children(tag)
-
-    def _children(self, tag: Tag) -> str:
-        return "".join(self._node(c) for c in tag.children)
+    threading.Thread(target=_install, daemon=True).start()
+    root.mainloop()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — AI IMAGE DESCRIBER
-# ══════════════════════════════════════════════════════════════════════════════
-
-_AI_PROMPT = (
-    "Beschreibe dieses Bild auf Deutsch präzise und vollständig. "
-    "Nenne alle UI-Elemente, sichtbaren Texte, Buttons, Werte und Zustände. "
-    "Sei so konkret und detailliert wie möglich."
-)
-_ALLOWED_MIME = {"image/png", "image/jpeg", "image/webp", "image/gif"}
-_IMG_CACHE: dict[str, str] = {}
+def _mark_setup_done():
+    s = load_settings()
+    s["setup_done"] = True
+    s["setup_version"] = APP_VERSION
+    save_settings(s)
 
 
-class AIDescriber:
-    def __init__(self, settings: "Settings") -> None:
-        self.settings = settings
+# ─── Einstellungen ────────────────────────────────────────────────────────────
 
-    def describe(self, img_bytes: bytes, mime: str, url: str) -> str:
-        if url in _IMG_CACHE:
-            return _IMG_CACHE[url]
-        provider = self.settings.get("ai_provider", "openai")
+def load_settings() -> dict:
+    if SETTINGS_FILE.exists():
         try:
-            if provider == "openai":
-                result = self._call_openai(img_bytes, mime)
-            else:
-                result = self._call_gemini(img_bytes, mime)
-        except Exception as exc:
-            result = f"[KI-Fehler: {exc}]"
-        _IMG_CACHE[url] = result
-        time.sleep(0.5)
-        return result
-
-    def _call_openai(self, img_bytes: bytes, mime: str) -> str:
-        from openai import OpenAI
-        api_key = self.settings.get_api_key("openai")
-        if not api_key:
-            return "[Kein OpenAI API-Key gesetzt]"
-        client = OpenAI(api_key=api_key)
-        b64 = base64.b64encode(img_bytes).decode("ascii")
-        data_url = f"data:{mime};base64,{b64}"
-        model = self.settings.get("openai_model", "gpt-4o")
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _AI_PROMPT},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }],
-            temperature=0.2,
-        )
-        return (resp.choices[0].message.content or "").strip()
-
-    def _call_gemini(self, img_bytes: bytes, mime: str) -> str:
-        from google import genai
-        from google.genai import types
-        api_key = self.settings.get_api_key("gemini")
-        if not api_key:
-            return "[Kein Gemini API-Key gesetzt]"
-        client = genai.Client(api_key=api_key)
-        model = self.settings.get("gemini_model", "gemini-2.0-flash")
-        img_part = types.Part.from_bytes(data=img_bytes, mime_type=mime)
-        resp = client.models.generate_content(
-            model=model,
-            contents=[_AI_PROMPT, img_part],
-        )
-        return (getattr(resp, "text", "") or "").strip()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — PLAYWRIGHT SCRAPER
-# ══════════════════════════════════════════════════════════════════════════════
-
-_MIN_IMG_DIM = 30
-
-
-def _scroll_to_bottom(page, max_iter: int = 40) -> None:
-    prev_height = 0
-    for _ in range(max_iter):
-        height = page.evaluate("document.documentElement.scrollHeight")
-        if height == prev_height:
-            break
-        prev_height = height
-        page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
-        page.wait_for_timeout(400)
-
-
-def _collect_page_images(page, ctx) -> list[tuple[str, bytes, str]]:
-    """Download images from the page via browser context (preserves auth/cookies)."""
-    img_infos = page.evaluate("""() => {
-        return Array.from(document.querySelectorAll('img')).map(img => ({
-            src: img.src || img.currentSrc || '',
-            data_src: img.getAttribute('data-src') || '',
-            data_lazy: img.getAttribute('data-lazy-src') || '',
-            srcset: img.srcset || img.getAttribute('srcset') || '',
-            complete: img.complete,
-            w: img.naturalWidth || 0,
-            h: img.naturalHeight || 0,
-        }))
-    }""")
-    result: list[tuple[str, bytes, str]] = []
-    seen: set[str] = set()
-
-    for info in img_infos:
-        src = (
-            info.get("src")
-            or info.get("data_src")
-            or info.get("data_lazy")
-            or ""
-        )
-        if not src:
-            for entry in (info.get("srcset") or "").split(","):
-                part = entry.strip().split()[0]
-                if part:
-                    src = part
-                    break
-        if not src or src.lower().endswith(".svg") or src in seen:
-            continue
-        w, h = info.get("w", 0) or 0, info.get("h", 0) or 0
-        if w < _MIN_IMG_DIM or h < _MIN_IMG_DIM:
-            continue
-        seen.add(src)
-        try:
-            r = ctx.request.get(src, timeout=20000)
-            if not r.ok:
-                continue
-            body = r.body()
-            ct = r.headers.get("content-type", "").split(";")[0].strip()
-            if ct not in _ALLOWED_MIME:
-                continue
-            result.append((src, body, ct))
+            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         except Exception:
-            continue
+            pass
+    return {}
 
+
+def save_settings(data: dict):
+    SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _default_formats() -> list:
+    """Gibt die 3 vorinstallierten Ausgabeformate zurück."""
+    return [
+        {"id": "builtin_md",  "name": "Jira-Markdown", "type": "markdown",
+         "extension": ".md",  "template": "", "fields": [], "params": {},
+         "builtin": True},
+        {"id": "builtin_xml", "name": "XML",  "type": "xml",
+         "extension": ".xml", "template": DEFAULT_XML_TEMPLATE,
+         "fields": ["title", "url", "content"],
+         "params": {"root_element": "page"},
+         "builtin": False},
+        {"id": "builtin_csv", "name": "CSV",  "type": "csv",
+         "extension": ".csv", "template": "",
+         "fields": list(DEFAULT_CSV_FIELDS),
+         "params": {"delimiter": ",", "quotechar": '"', "include_header": True},
+         "builtin": False},
+    ]
+
+
+def get_formats() -> list:
+    """Lädt die konfigurierten Formate (mit Defaults wenn leer)."""
+    s = load_settings()
+    fmts = s.get("formats", [])
+    if not fmts:
+        fmts = _default_formats()
+        s["formats"] = fmts
+        save_settings(s)
+    return fmts
+
+
+def get_active_format() -> dict:
+    """Gibt das aktuell aktive Ausgabeformat zurück."""
+    s    = load_settings()
+    fmts = get_formats()
+    aid  = s.get("active_format", "builtin_md")
+    for f in fmts:
+        if f["id"] == aid:
+            return f
+    return fmts[0]
+
+
+def _apply_template(template: str, data: dict) -> str:
+    """Ersetzt {{key}}-Platzhalter im Template durch data[key]."""
+    result = template
+    for k, v in data.items():
+        result = result.replace("{{" + k + "}}", str(v))
     return result
 
 
-def scrape_page(
-    url: str,
-    headless: bool,
-    max_images: int,
-    ai_describe: bool,
-    settings: "Settings",
-    stop_event: threading.Event,
-    progress_cb=None,
-) -> tuple[str, str]:
-    """
-    Scrape *url* and return (markdown_text, page_title).
-    progress_cb(msg: str, pct: int | None) is called for UI updates.
-    """
-
-    def _log(msg: str, pct: int | None = None) -> None:
-        if progress_cb:
-            progress_cb(msg, pct)
-
-    converter = HtmlToMarkdown(base_url=url)
-    describer = AIDescriber(settings) if ai_describe else None
-    title = ""
-
-    browser = None
+def _version_tuple(v: str) -> tuple:
+    """Konvertiert '1.2.3' → (1, 2, 3) für korrekten Versionsvergleich."""
     try:
+        return tuple(int(x) for x in v.strip().lstrip("v").split("."))
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+
+
+def _check_for_update(token: str):
+    """
+    Prüft GitHub Releases auf eine neuere Version.
+    Gibt (version_str, asset_url) zurück oder None.
+    """
+    import urllib.request as _ureq
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept":        "application/vnd.github.v3+json",
+        "User-Agent":    f"website-scraper/{APP_VERSION}",
+    }
+    req = _ureq.Request(f"{GITHUB_API_BASE}/releases/latest", headers=headers)
+    with _ureq.urlopen(req, timeout=8) as resp:
+        data = json.loads(resp.read())
+    latest_tag = data.get("tag_name", "")
+    latest_ver = latest_tag.lstrip("v")
+    if _version_tuple(latest_ver) > _version_tuple(APP_VERSION):
+        asset_url = next(
+            (a["url"] for a in data.get("assets", [])
+             if a["name"] == "website_scraper.py"),
+            None,
+        )
+        if asset_url is None:
+            return None  # Release ohne Asset → kein automatisches Update möglich
+        return latest_ver, asset_url
+    return None
+
+
+def _download_update(token: str, asset_url: str) -> bytes:
+    """
+    Lädt das Update-Asset von GitHub herunter.
+    requests (in requirements.txt) entfernt den Authorization-Header beim
+    Redirect zu S3 automatisch (cross-domain redirect stripping).
+    """
+    import requests as _req
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept":        "application/octet-stream",
+        "User-Agent":    f"website-scraper/{APP_VERSION}",
+    }
+    resp = _req.get(asset_url, headers=headers, timeout=60)
+    resp.raise_for_status()
+    return resp.content
+
+
+# ─── API-Key-Verwaltung (keyring + Fallback) ──────────────────────────────────
+
+_USE_KEYRING = None  # None = uninitialized, True/False = keyring available/not
+
+
+def _init_keyring():
+    global _USE_KEYRING
+    if _USE_KEYRING is not None:
+        return
+    try:
+        import keyring as kr
+        kr.get_keyring()
+        _USE_KEYRING = True
+    except Exception:
+        _USE_KEYRING = False
+
+
+def get_api_key(provider: str) -> str:
+    _init_keyring()
+    if _USE_KEYRING:
+        try:
+            import keyring as kr
+            val = kr.get_password(APP_NAME, provider)
+            return val or ""
+        except Exception:
+            pass
+    return load_settings().get(f"key_{provider}", "")
+
+
+def set_api_key(provider: str, value: str):
+    _init_keyring()
+    if _USE_KEYRING:
+        try:
+            import keyring as kr
+            kr.set_password(APP_NAME, provider, value)
+            return
+        except Exception:
+            pass
+    s = load_settings()
+    s[f"key_{provider}"] = value
+    save_settings(s)
+
+
+# ─── Sitemap-Parser ───────────────────────────────────────────────────────────
+
+def _fetch_sitemap_urls(sitemap_url: str, log_fn=None) -> list:
+    """Lädt und parst eine XML-Sitemap (inkl. Sitemap-Index, .gz)."""
+    import urllib.request as ureq
+
+    if log_fn:
+        log_fn(f"  Lade Sitemap: {sitemap_url}")
+
+    try:
+        req = ureq.Request(
+            sitemap_url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; WebScraper/1.0)"},
+        )
+        with ureq.urlopen(req, timeout=30) as resp:
+            content = resp.read()
+
+        # Gzip-Dekompression
+        if sitemap_url.lower().endswith(".gz") or content[:2] == b"\x1f\x8b":
+            content = gzip.decompress(content)
+
+        root = ET.fromstring(content)
+
+        # Namespace ermitteln
+        ns_match = re.match(r"\{(.*?)\}", root.tag)
+        ns = ns_match.group(1) if ns_match else ""
+
+        def _tag(name):
+            return f"{{{ns}}}{name}" if ns else name
+
+        # Sitemap-Index? → Sub-Sitemaps rekursiv laden
+        sub_sitemaps = root.findall(_tag("sitemap"))
+        if sub_sitemaps:
+            urls = []
+            for sm in sub_sitemaps:
+                loc = sm.find(_tag("loc"))
+                if loc is not None and loc.text:
+                    child_urls = _fetch_sitemap_urls(loc.text.strip(), log_fn)
+                    urls.extend(child_urls)
+                    if log_fn:
+                        log_fn(f"  Sub-Sitemap: {len(child_urls)} URLs")
+            return urls
+
+        # Normale Sitemap
+        urls = []
+        for url_el in root.findall(_tag("url")):
+            loc = url_el.find(_tag("loc"))
+            if loc is not None and loc.text:
+                urls.append(loc.text.strip())
+
+        return urls
+
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"  Sitemap-Fehler: {exc}")
+        return []
+
+
+def _url_to_filename(url: str, ext: str = ".md") -> str:
+    """Erstellt einen eindeutigen, sicheren Dateinamen aus einer URL."""
+    parsed = urlparse(url)
+    path = parsed.path.strip("/")
+    if not path:
+        name = re.sub(r"[^\w\-]", "_", parsed.netloc)
+    else:
+        name = re.sub(r"[^\w\-]", "_", path.replace("/", "__"))
+    name = re.sub(r"_+", "_", name).strip("_")[:100] or "index"
+    return name + ext
+
+
+# ─── Simulationsmodus ────────────────────────────────────────────────────────
+
+def _sim_html(url: str) -> str:
+    """Erzeugt eine realistische Dummy-HTML-Seite für den Simulationsmodus."""
+    parsed = urlparse(url)
+    title = parsed.path.strip("/").replace("/", " › ") or parsed.netloc
+    title = title.capitalize() or "Startseite"
+    return f"""<!DOCTYPE html>
+<html lang="de">
+<head><title>[SIM] {title}</title></head>
+<body>
+<main>
+  <h1>{title}</h1>
+  <p>Dies ist eine <strong>simulierte Seite</strong> für Testzwecke.
+     Kein Browser wurde geöffnet, kein API-Key wurde verwendet.</p>
+  <p>Quell-URL: <a href="{url}">{url}</a></p>
+
+  <h2>Abschnitt 1 – Textinhalt</h2>
+  <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+     Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>
+  <blockquote>
+    <p>💡 Hinweis: Dieser Inhalt wurde im Simulationsmodus generiert und
+       entspricht nicht dem echten Seiteninhalt.</p>
+  </blockquote>
+
+  <h2>Abschnitt 2 – Liste</h2>
+  <ul>
+    <li>Simulierter Listenpunkt 1</li>
+    <li>Simulierter Listenpunkt 2
+      <ul>
+        <li>Verschachtelter Punkt A</li>
+        <li>Verschachtelter Punkt B</li>
+      </ul>
+    </li>
+    <li>Simulierter Listenpunkt 3</li>
+  </ul>
+
+  <h2>Abschnitt 3 – Tabelle</h2>
+  <table>
+    <tr><th>Eigenschaft</th><th>Wert</th><th>Beschreibung</th></tr>
+    <tr><td>URL</td><td><code>{url}</code></td><td>Gescrapte Seite</td></tr>
+    <tr><td>Modus</td><td>Simulation</td><td>Kein echtes Scraping</td></tr>
+    <tr><td>Bilder</td><td>0</td><td>Keine AI-Calls im Simulationsmodus</td></tr>
+  </table>
+
+  <h2>Abschnitt 4 – Code</h2>
+  <pre><code class="language-python"># Beispiel-Code (simuliert)
+def scrape(url):
+    return "Markdown-Inhalt"
+</code></pre>
+
+  <h3>Details-Block</h3>
+  <details>
+    <summary>Mehr Informationen</summary>
+    <p>Dieser aufklappbare Bereich enthält zusätzliche Informationen,
+       die im Simulationsmodus als Beispiel für das Details-Element dienen.</p>
+  </details>
+</main>
+</body>
+</html>"""
+
+
+# ─── Zeitersparnis-Hilfsfunktionen ───────────────────────────────────────────
+
+def _estimate_human_time(md_paths: list):
+    """Schätzt Menschenzeit anhand Wort- und Bildanzahl der Markdown-Ausgaben.
+    Gibt (gesamt_min, wörter, bilder) zurück."""
+    total_min, total_words, total_images = 0.0, 0, 0
+    for path in md_paths:
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except Exception:
+            text = ""
+        # Nur Seiteninhalt zählen – KI-Bildbeschreibungen (Blockquotes) ausschließen
+        content = " ".join(l for l in text.splitlines() if not l.startswith(">"))
+        words = len(content.split())
+        images = text.count("> 📷")
+        page_min = max(
+            HUMAN_MIN_MIN_PER_PAGE,
+            HUMAN_MIN_BASE
+            + (words / 100) * HUMAN_MIN_PER_100_WORDS
+            + images * HUMAN_MIN_PER_IMAGE,
+        )
+        total_min += page_min
+        total_words += words
+        total_images += images
+    return total_min, total_words, total_images
+
+
+def _fmt_min(minutes: float) -> str:
+    """Formatiert Minuten als '2 Std 05 Min' / '14 Min 32 Sek' / '45 Sek'."""
+    total_secs = int(minutes * 60)
+    h, rem = divmod(total_secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h} Std {m:02d} Min"
+    if m:
+        return f"{m} Min {s:02d} Sek"
+    return f"{s} Sek"
+
+
+def _save_run(url: str, mode: str, pages: int,
+              tool_min: float, human_min: float):
+    """Fügt einen Lauf zur persistenten Historie in settings.json hinzu."""
+    saved_min = max(0.0, human_min - tool_min)
+    pct = int(saved_min / max(human_min, 0.01) * 100)
+    entry = {
+        "date": time.strftime("%d.%m.%Y %H:%M"),
+        "mode": mode, "url": url, "pages": pages,
+        "tool_min": round(tool_min, 2),
+        "human_min": round(human_min, 2),
+        "saved_min": round(saved_min, 2),
+        "pct": pct,
+    }
+    s = load_settings()
+    runs = s.get("runs", [])
+    runs.append(entry)
+    s["runs"] = runs[-MAX_RUNS_HISTORY:]
+    save_settings(s)
+
+
+# ─── Scraper-Kern ─────────────────────────────────────────────────────────────
+
+class Scraper:
+    def __init__(self, settings: dict,
+                 log_fn=None, progress_fn=None, stop_event=None):
+        self.settings = settings
+        self._log = log_fn or print
+        self._progress = progress_fn or (lambda v: None)
+        self._stop = stop_event or threading.Event()
+        self.base_url = ""
+        self._img_cache: dict = {}
+        self._img_data: dict = {}
+        self._img_pos_map: dict = {}
+        self._img_counter = [0]
+        self._img_total = [0]
+
+    def run(self, url: str, output_path: str, output_format: dict = None):
+        self.base_url = url
+        self._log(f"Öffne Seite: {url}")
+        self._progress(5)
+
+        html, img_data = self._browse(url)
+        if self._stop.is_set():
+            return
+
+        self._progress(42)
+        self._log("Konvertiere Inhalt zu Markdown…")
+
+        md = self._to_markdown(html, img_data)
+        if self._stop.is_set():
+            return
+
+        self._progress(95)
+        fmt      = output_format or {"type": "markdown", "extension": ".md"}
+        fmt_type = fmt.get("type", "markdown")
+        if fmt_type == "xml":
+            content = self._render_xml(md, html, fmt)
+        elif fmt_type == "csv":
+            content = self._render_csv(md, html, fmt)
+        else:
+            template = fmt.get("template", "")
+            if template:
+                vars_ = self._extract_page_vars(md, html)
+                content = _apply_template(template, vars_)
+            else:
+                content = md
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text(content, encoding="utf-8")
+        self._log(f"Gespeichert: {output_path}")
+        self._progress(100)
+
+    # ── Seiten-Variablen / Format-Konverter ───────────────────────────────────
+
+    def _extract_page_vars(self, md: str, html: str) -> dict:
+        """Extrahiert Seitendaten als Dict für Template-Platzhalter."""
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+        title = soup.title.get_text().strip() if soup.title else ""
+        if not title:
+            h1 = soup.find("h1")
+            title = h1.get_text().strip() if h1 else ""
+        meta_tag  = soup.find("meta", attrs={"name": "description"})
+        meta_desc = meta_tag.get("content", "").strip() if meta_tag else ""
+        body       = soup.body or soup
+        plain_text = body.get_text(separator=" ", strip=True)
+        return {
+            "title":            title,
+            "url":              self.base_url,
+            "content":          md,
+            "text":             plain_text,
+            "meta_description": meta_desc,
+            "date":             time.strftime("%d.%m.%Y"),
+            "images_count":     str(len(self._img_data)),
+        }
+
+    def _render_xml(self, md: str, html: str, fmt: dict) -> str:
+        """Rendert die Seite als XML gemäß Format-Template."""
+        data     = self._extract_page_vars(md, html)
+        template = fmt.get("template", "") or DEFAULT_XML_TEMPLATE
+        return _apply_template(template, data)
+
+    def _render_csv(self, md: str, html: str, fmt: dict) -> str:
+        """Rendert die Seite als CSV-Zeile gemäß Format-Konfiguration."""
+        import csv as _csv
+        import io
+        data   = self._extract_page_vars(md, html)
+        params = fmt.get("params", {})
+        fields = fmt.get("fields", DEFAULT_CSV_FIELDS) or DEFAULT_CSV_FIELDS
+        buf    = io.StringIO()
+        writer = _csv.writer(
+            buf,
+            delimiter=params.get("delimiter", ","),
+            quotechar=params.get("quotechar", '"'),
+            quoting=_csv.QUOTE_ALL,
+        )
+        if params.get("include_header", True):
+            writer.writerow(fields)
+        writer.writerow([data.get(f, "") for f in fields])
+        return buf.getvalue()
+
+    # ── Browser ──────────────────────────────────────────────────────────────
+
+    def _browse(self, url: str):
+        # ── Simulationsmodus ──────────────────────────────────────────────────
+        if self.settings.get("simulate"):
+            delay = random.uniform(0.8, 2.5)
+            self._log(f"  [SIM] Simuliere Seitenlade ({delay:.1f} s)…")
+            # Fortschritt schrittweise von 5 % → 38 % während der simulierten Ladezeit
+            steps = 12
+            for i in range(steps):
+                if self._stop.is_set():
+                    return "", {}
+                time.sleep(delay / steps)
+                self._progress(5 + int(33 * (i + 1) / steps))
+            self._log("  [SIM] Erzeuge Dummy-Inhalt…")
+            return _sim_html(url), {}
+        # ─────────────────────────────────────────────────────────────────────
+
+        from playwright.sync_api import sync_playwright
+
+        headless = self.settings.get("headless", True)
+        max_imgs = int(self.settings.get("max_images", 30))
+        describe = self.settings.get("describe_images", True)
+
+        img_data: dict = {}
+
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=headless)
             try:
                 ctx = browser.new_context(
+                    viewport={"width": 1280, "height": 900},
                     user_agent=(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 WebsiteScraper/1.0"
-                    )
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
                 )
                 page = ctx.new_page()
 
-                _log("Lade Seite …", 10)
-                page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                page.wait_for_timeout(2_000)
+                self._log("Lade Seite…")
+                self._progress(10)
+                page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+                page.wait_for_timeout(2000)
+                self._progress(20)
 
-                if stop_event.is_set():
-                    return "", ""
+                self._log("Scrolle Seite (lade Lazy-Content)…")
+                self._full_scroll(page)
+                self._progress(32)
 
-                _log("Scrolle bis Ende …", 20)
-                _scroll_to_bottom(page)
+                if describe and not self._stop.is_set():
+                    # Warten bis alle Bilder geladen sind (max. 5 Sek.)
+                    try:
+                        page.wait_for_function(
+                            "() => Array.from(document.images).every(img => img.complete)",
+                            timeout=5000,
+                        )
+                    except Exception:
+                        pass  # Nicht alle geladen – trotzdem fortfahren
 
-                if stop_event.is_set():
-                    return "", ""
+                    # Index-Attribut injizieren + Bild-Infos auslesen (VOR page.content(),
+                    # damit data-scraper-idx im HTML-Snapshot enthalten ist).
+                    # Für noch nicht geladene Bilder: offsetWidth/offsetHeight als Fallback.
+                    img_infos = page.evaluate("""() => {
+                        const imgs = Array.from(document.querySelectorAll('img'));
+                        imgs.forEach((img, idx) => img.setAttribute('data-scraper-idx', String(idx)));
+                        return imgs.map((img, idx) => {
+                            const w = img.complete ? img.naturalWidth
+                                      : Math.max(img.offsetWidth,
+                                                 parseInt(img.getAttribute('width') || '0'));
+                            const h = img.complete ? img.naturalHeight
+                                      : Math.max(img.offsetHeight,
+                                                 parseInt(img.getAttribute('height') || '0'));
+                            const src = (img.complete ? img.currentSrc : '') || img.src ||
+                                        img.getAttribute('data-src') ||
+                                        img.getAttribute('data-lazy-src') || '';
+                            return {
+                                idx: idx,
+                                src: src,
+                                originalSrc: img.getAttribute('src') || '',
+                                alt: img.alt || '',
+                                width: w,
+                                height: h,
+                                complete: img.complete
+                            };
+                        });
+                    }""")
 
-                title = page.title()
+                    candidates = [
+                        info for info in img_infos
+                        if info["src"]
+                        and info["width"] >= 30
+                        and info["height"] >= 30
+                        and not info["src"].lower().endswith(".svg")
+                        and "image/svg" not in info["src"]
+                    ][:max_imgs]
+
+                    total = len(candidates)
+                    incomplete = sum(1 for i in img_infos if not i.get("complete", True) and i["src"])
+                    skip_info = f" · {incomplete} noch nicht fertig geladen" if incomplete else ""
+                    self._log(f"Lade {total} Bilder… (von {len(img_infos)} img-Elementen{skip_info})")
+
+                    for i, info in enumerate(candidates):
+                        if self._stop.is_set():
+                            break
+                        self._download_image(ctx, info, img_data)
+                        self._progress(32 + int(10 * (i + 1) / max(total, 1)))
+
+                else:
+                    img_infos = []
+
+                # HTML-Snapshot NACH Attribut-Injektion aufnehmen
                 html = page.content()
 
-                _log("Konvertiere HTML → Markdown …", 40)
-                md, image_list = converter.convert(html)
-
-                if stop_event.is_set():
-                    return "", ""
-
-                if ai_describe and describer and image_list:
-                    _log("Lade Bilder für KI …", 50)
-                    img_data = _collect_page_images(page, ctx)
-                    url_to_data = {u: (b, m) for u, b, m in img_data}
-
-                    for idx, (img_url, label) in enumerate(image_list[:max_images]):
-                        if stop_event.is_set():
-                            break
-                        pct = 50 + int(idx / max(len(image_list), 1) * 45)
-                        _log(f"KI beschreibt: {label[:40]} …", pct)
-                        if img_url in url_to_data:
-                            img_bytes, mime = url_to_data[img_url]
-                            desc = describer.describe(img_bytes, mime, img_url)
-                            md = md.replace("_(Bildbeschreibung folgt)_", desc, 1)
             finally:
-                if browser is not None:
-                    browser.close()
-                    browser = None
-    except Exception:
-        if browser is not None:
-            try:
                 browser.close()
+
+        return html, img_data
+
+    def _full_scroll(self, page):
+        prev = -1
+        iterations = 0
+        while iterations < 40:
+            page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
+            page.wait_for_timeout(400)
+            h = page.evaluate("document.body.scrollHeight")
+            if h == prev:
+                break
+            prev = h
+            iterations += 1
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(300)
+
+    def _download_image(self, ctx, info: dict, img_data: dict):
+        abs_src = info["src"]
+        orig_src = info["originalSrc"]
+        idx = info.get("idx", -1)
+        try:
+            response = ctx.request.get(abs_src)
+            if not response.ok:
+                self._log(f"  [Bild] HTTP {response.status}: {abs_src[:90]}")
+                return
+            ct = response.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+            if ct not in SUPPORTED_MIMES:
+                self._log(f"  [Bild] Übersprungen ({ct}): {abs_src[:90]}")
+                return
+            b64 = base64.b64encode(response.body()).decode()
+            img_data[abs_src] = (b64, ct)
+            # Auch relative Variante speichern (Pfad ohne Domain)
+            try:
+                parsed = urlparse(abs_src)
+                rel = parsed.path + ("?" + parsed.query if parsed.query else "")
+                if rel and rel != abs_src:
+                    img_data[rel] = (b64, ct)
             except Exception:
                 pass
-        raise
+            if orig_src:
+                img_data[orig_src] = (b64, ct)
+            # Positions-Index als primärer Fallback (data-scraper-idx im HTML-Snapshot)
+            if idx >= 0:
+                img_data[f"__pos_{idx}"] = (b64, ct)
+        except Exception as e:
+            self._log(f"  [Bild] Fehler: {e} – {abs_src[:90]}")
 
-    header = (
-        f"# {title}\n\n"
-        f"**URL:** {url}  \n"
-        f"**Erstellt:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-        "---\n\n"
-    )
-    _log("Fertig!", 100)
-    return header + md, title
+    # ── HTML → Markdown ───────────────────────────────────────────────────────
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — WORKER THREADS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _format_eta(remaining_secs: float, avg_secs: float) -> str:
-    avg_str = f"Ø {avg_secs:.1f} Sek / Seite"
-    if remaining_secs >= 3600:
-        h = int(remaining_secs // 3600)
-        m = int((remaining_secs % 3600) // 60)
-        return f"Noch ca. {h} h {m} min  |  {avg_str}"
-    m = int(remaining_secs // 60)
-    s = int(remaining_secs % 60)
-    return f"Noch ca. {m} min {s} sek  |  {avg_str}"
-
-
-class SinglePageWorker(QThread):
-    progress = pyqtSignal(str, int)
-    log      = pyqtSignal(str)
-    done     = pyqtSignal(str, str)   # (filepath, title)
-    finished_work = pyqtSignal(bool, str)
-
-    def __init__(
-        self, url: str, out_dir: str, settings: Settings,
-        stop_event: threading.Event,
-    ) -> None:
-        super().__init__()
-        self.url = url
-        self.out_dir = out_dir
-        self.settings = settings
-        self.stop_event = stop_event
-
-    def run(self) -> None:
+    def _to_markdown(self, html: str, img_data: dict) -> str:
         try:
-            def _cb(msg: str, pct: int | None = None) -> None:
-                self.progress.emit(msg, pct or 0)
-                self.log.emit(msg)
+            from bs4 import BeautifulSoup
+            try:
+                soup = BeautifulSoup(html, "lxml")
+            except Exception:
+                soup = BeautifulSoup(html, "html.parser")
+        except ImportError:
+            return "# Fehler\n\nBeautifulSoup nicht verfügbar.\n"
 
-            md, title = scrape_page(
-                self.url,
-                self.settings.get("browser_headless", True),
-                self.settings.get("max_images_per_page", 30),
-                self.settings.get("ai_describe_images", False),
-                self.settings,
-                self.stop_event,
-                _cb,
-            )
-            if self.stop_event.is_set():
-                self.finished_work.emit(False, "Abgebrochen.")
-                return
+        title_tag = soup.find("title")
+        page_title = title_tag.get_text(strip=True) if title_tag else ""
 
-            out = Path(self.out_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            fpath = out / url_to_filename(self.url)
-            fpath.write_text(md, encoding="utf-8")
-            self.done.emit(str(fpath), title)
-            self.finished_work.emit(True, f"Gespeichert: {fpath}")
-        except Exception as exc:
-            self.finished_work.emit(False, f"Fehler: {exc}")
+        for dead in soup.find_all(["script", "style", "noscript", "svg",
+                                   "iframe", "template"]):
+            dead.decompose()
 
+        # Globale Positions-Map: BeautifulSoup-Element-ID → DOM-Index aus JS-Evaluation
+        # Beide traversieren in document order ohne noscript/template → Indizes stimmen überein
+        _body = soup.body or soup
+        self._img_pos_map = {id(el): i for i, el in enumerate(_body.find_all("img"))}
 
-class SitemapWorker(QThread):
-    progress     = pyqtSignal(str, int)
-    eta_update   = pyqtSignal(str)
-    log          = pyqtSignal(str)
-    done         = pyqtSignal(str, str)
-    finished_work = pyqtSignal(bool, str)
+        root = (
+            soup.find("main")
+            or soup.find("article")
+            or soup.find(id=re.compile(r"\b(content|main|article)\b", re.I))
+            or soup.find("div", class_=re.compile(r"\b(content|main|article)\b", re.I))
+            or soup.body
+            or soup
+        )
 
-    def __init__(
-        self, sitemap_url: str, out_dir: str, settings: Settings,
-        stop_event: threading.Event,
-    ) -> None:
-        super().__init__()
-        self.sitemap_url = sitemap_url
-        self.out_dir = out_dir
-        self.settings = settings
-        self.stop_event = stop_event
+        self._img_data = img_data
+        self._img_counter = [0]
+        self._img_total = [len(list(root.find_all("img")))]
 
-    def run(self) -> None:
-        try:
-            self.log.emit("Lese Sitemap …")
-            self.progress.emit("Lese Sitemap …", 0)
-            urls = parse_sitemap(self.sitemap_url)
-            if not urls:
-                self.finished_work.emit(False, "Keine URLs in Sitemap gefunden.")
-                return
+        lines: list = []
+        if page_title:
+            lines += ["", f"# {page_title}", ""]
 
-            total = len(urls)
-            self.log.emit(f"{total} URLs gefunden.")
-            out = Path(self.out_dir)
-            out.mkdir(parents=True, exist_ok=True)
+        self._node(root, lines)
 
-            headless   = self.settings.get("browser_headless", True)
-            ai_imgs    = self.settings.get("ai_describe_images", False)
-            max_imgs   = self.settings.get("max_images_per_page", 30)
-            page_times: list[float] = []
-            index_entries: list[tuple[str, str, str]] = []
+        md = "\n".join(lines)
+        md = re.sub(r"\n{3,}", "\n\n", md)
+        return md.strip() + "\n"
 
-            for i, url in enumerate(urls):
-                if self.stop_event.is_set():
-                    break
+    def _node(self, el, out: list):
+        from bs4 import NavigableString, Tag
 
-                pct = int(i / total * 100)
-                self.progress.emit(f"Seite {i + 1} von {total} ({pct} %)", pct)
+        if isinstance(el, NavigableString):
+            t = str(el).strip()
+            if t:
+                out.append(t)
+            return
 
-                if page_times:
-                    avg = sum(page_times) / len(page_times)
-                    self.eta_update.emit(_format_eta(avg * (total - i), avg))
+        if not isinstance(el, Tag):
+            return
 
-                t0 = time.time()
+        tag = (el.name or "").lower()
 
-                def _cb(msg: str, _p: int | None = None, _i: int = i) -> None:
-                    self.log.emit(f"[{_i + 1}/{total}] {msg}")
+        if tag in ("script", "style", "noscript", "svg", "template", "nav", "footer"):
+            return
 
-                try:
-                    md, title = scrape_page(
-                        url, headless, max_imgs, ai_imgs,
-                        self.settings, self.stop_event, _cb,
-                    )
-                except Exception as exc:
-                    self.log.emit(f"Fehler bei {url}: {exc}")
-                    page_times.append(time.time() - t0)
-                    continue
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            n = int(tag[1])
+            txt = self._inline(el).strip()
+            if txt:
+                out += ["", f"{'#' * n} {txt}", ""]
+            return
 
-                if self.stop_event.is_set():
-                    break
+        if tag == "p":
+            txt = self._inline(el).strip()
+            if txt:
+                out += ["", txt, ""]
+            return
 
-                fname = url_to_filename(url)
-                fpath = out / fname
-                try:
-                    fpath.write_text(md, encoding="utf-8")
-                    index_entries.append((url, title or url, fname))
-                    self.done.emit(str(fpath), title or url)
-                except Exception as exc:
-                    self.log.emit(f"Schreibfehler: {exc}")
+        if tag == "blockquote":
+            inner: list = []
+            for ch in el.children:
+                self._node(ch, inner)
+            for line in "\n".join(inner).splitlines():
+                out.append(f"> {line}" if line.strip() else ">")
+            out.append("")
+            return
 
-                page_times.append(time.time() - t0)
+        if tag == "pre":
+            code = el.find("code")
+            text = (code or el).get_text()
+            lang = ""
+            if code:
+                for cls in (code.get("class") or []):
+                    if cls.startswith("language-"):
+                        lang = cls[9:]
+                        break
+            out += ["", f"```{lang}", text.rstrip(), "```", ""]
+            return
 
-            if index_entries:
-                self._write_index(out, index_entries)
+        if tag == "img":
+            self._img_block(el, out)
+            return
 
-            if self.stop_event.is_set():
-                self.finished_work.emit(
-                    False, f"Abgebrochen nach {len(index_entries)} Seiten."
-                )
+        if tag == "figure":
+            img = el.find("img")
+            cap = el.find("figcaption")
+            if img:
+                self._img_block(img, out, caption=self._inline(cap).strip() if cap else "")
+            return
+
+        if tag == "table":
+            # Tabelle mit Bildern → als Container rekursiv verarbeiten (Bilder nicht verwerfen)
+            if el.find("img"):
+                for ch in el.children:
+                    self._node(ch, out)
             else:
-                self.finished_work.emit(
-                    True,
-                    f"{len(index_entries)} Seiten gespeichert in {out}",
-                )
-        except Exception as exc:
-            self.finished_work.emit(False, f"Fehler: {exc}")
+                self._table(el, out)
+            return
 
-    def _write_index(self, out: Path, entries: list[tuple[str, str, str]]) -> None:
-        lines = [
-            "# Sitemap-Übersicht\n",
-            f"**Sitemap:** {self.sitemap_url}  ",
-            f"**Erstellt:** {datetime.now().strftime('%Y-%m-%d %H:%M')}  ",
-            f"**Seiten:** {len(entries)}\n",
-            "---\n",
-        ]
-        for url, title, fname in entries:
-            lines.append(f"- [{title}]({fname}) — {url}")
-        (out / "_index.md").write_text("\n".join(lines), encoding="utf-8")
+        if tag == "ul":
+            out.append("")
+            for li in el.find_all("li", recursive=False):
+                self._list_item(li, out, indent=0, ordered=False, num=None)
+            out.append("")
+            return
 
+        if tag == "ol":
+            out.append("")
+            for i, li in enumerate(el.find_all("li", recursive=False), 1):
+                self._list_item(li, out, indent=0, ordered=True, num=i)
+            out.append("")
+            return
 
-class SimulationWorker(QThread):
-    progress     = pyqtSignal(str, int)
-    eta_update   = pyqtSignal(str)
-    log          = pyqtSignal(str)
-    done         = pyqtSignal(str, str)
-    finished_work = pyqtSignal(bool, str)
+        if tag == "details":
+            summ = el.find("summary")
+            if summ:
+                out += ["", f"**{self._inline(summ).strip()}**", ""]
+            for ch in el.children:
+                if not (isinstance(ch, Tag) and ch.name == "summary"):
+                    self._node(ch, out)
+            return
 
-    def __init__(
-        self, mode: str, url: str, out_dir: str,
-        stop_event: threading.Event,
-    ) -> None:
-        super().__init__()
-        self.mode = mode
-        self.url = url
-        self.out_dir = out_dir
-        self.stop_event = stop_event
+        if tag == "hr":
+            out += ["", "---", ""]
+            return
 
-    def run(self) -> None:
-        if self.mode == "single":
-            self._sim_single()
-        else:
-            self._sim_sitemap()
+        if tag == "iframe":
+            src = el.get("src", "")
+            if src:
+                out += ["", f"[Eingebetteter Inhalt]({src})", ""]
+            return
 
-    def _sim_single(self) -> None:
-        self.log.emit("[SIM] Einzelseiten-Simulation gestartet")
-        steps = [
-            ("Browser starten (simuliert) …", 5),
-            ("Seite laden …", 15),
-            ("Scrollen …", 30),
-            ("HTML verarbeiten …", 50),
-            ("Markdown konvertieren …", 75),
-            ("Datei schreiben …", 90),
-        ]
-        for msg, pct in steps:
-            if self.stop_event.is_set():
-                self.finished_work.emit(False, "Abgebrochen.")
+        if tag in ("div", "section", "aside", "article", "main", "header"):
+            classes = " ".join(el.get("class") or []).lower()
+            if re.search(
+                r"\b(note|tip|warning|caution|danger|info|hint|alert|callout|admonition|notice)\b",
+                classes,
+            ):
+                inner: list = []
+                for ch in el.children:
+                    self._node(ch, inner)
+                for line in "\n".join(inner).splitlines():
+                    out.append(f"> {line}" if line.strip() else ">")
+                out.append("")
                 return
-            self.progress.emit(msg, pct)
-            self.log.emit(f"[SIM] {msg}")
-            time.sleep(random.uniform(0.3, 0.7))
 
-        out = Path(self.out_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        url = self.url or "https://beispiel.de/seite"
-        fname = url_to_filename(url)
-        fpath = out / fname
-        fpath.write_text(_dummy_md(url, "Simulierte Einzelseite"), encoding="utf-8")
-        self.done.emit(str(fpath), "Simulierte Einzelseite")
-        self.progress.emit("Fertig!", 100)
-        self.finished_work.emit(True, f"Simulation abgeschlossen: {fpath}")
+        for ch in el.children:
+            self._node(ch, out)
 
-    def _sim_sitemap(self) -> None:
-        sim_urls = [f"https://beispiel.de/seite-{i}" for i in range(1, 9)]
-        total = len(sim_urls)
-        self.log.emit(f"[SIM] Sitemap-Simulation: {total} Seiten")
-        out = Path(self.out_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        page_times: list[float] = []
-        index_entries: list[tuple[str, str, str]] = []
+    # ── Inline-Konverter ──────────────────────────────────────────────────────
 
-        for i, url in enumerate(sim_urls):
-            if self.stop_event.is_set():
-                break
+    def _inline(self, el) -> str:
+        from bs4 import NavigableString, Tag
 
-            pct = int(i / total * 100)
-            self.progress.emit(f"Seite {i + 1} von {total} ({pct} %)", pct)
+        if isinstance(el, NavigableString):
+            return str(el)
+        if not isinstance(el, Tag):
+            return ""
 
-            if page_times:
-                avg = sum(page_times) / len(page_times)
-                self.eta_update.emit(_format_eta(avg * (total - i), avg))
+        tag = (el.name or "").lower()
 
-            t0 = time.time()
-            delay = random.uniform(0.8, 2.5)
-            sub_steps = ["Starte …", "Lade …", "Scrolle …", "HTML …", "Markdown …", "Speichere …"]
-            for step_msg in sub_steps:
-                if self.stop_event.is_set():
+        if tag in ("script", "style"):
+            return ""
+
+        if tag in ("strong", "b"):
+            inner = self._inline_children(el)
+            return f"**{inner}**" if inner.strip() else inner
+
+        if tag in ("em", "i"):
+            inner = self._inline_children(el)
+            return f"*{inner}*" if inner.strip() else inner
+
+        if tag in ("del", "s", "strike"):
+            inner = self._inline_children(el)
+            return f"~~{inner}~~" if inner.strip() else inner
+
+        if tag == "code":
+            return f"`{el.get_text()}`"
+
+        if tag == "a":
+            href = el.get("href", "")
+            if href and not href.startswith("#"):
+                if not href.startswith("http"):
+                    href = urljoin(self.base_url, href)
+            inner = self._inline_children(el).strip()
+            if href and inner:
+                return f"[{inner}]({href})"
+            return inner
+
+        if tag == "br":
+            return "\n"
+
+        if tag == "img":
+            alt = el.get("alt", "")
+            return f"[Bild: {alt}]" if alt else ""
+
+        return self._inline_children(el)
+
+    def _inline_children(self, el) -> str:
+        return "".join(self._inline(ch) for ch in el.children)
+
+    # ── Bild-Block ────────────────────────────────────────────────────────────
+
+    def _img_block(self, el, out: list, caption: str = ""):
+        src = (
+            el.get("src")
+            or el.get("data-src")
+            or el.get("data-lazy-src")
+            or el.get("data-original")
+            or (el.get("data-srcset", "").split() or [""])[0]
+            or (el.get("srcset", "").split(",")[0].strip().split() or [""])[0]
+            or ""
+        )
+        # Daten-URIs und Blob-URLs sind keine echten Bild-URLs
+        if src.startswith(("data:", "blob:")):
+            src = ""
+
+        alt = el.get("alt", "")
+        title_attr = el.get("title", "")
+        label = caption or title_attr or alt or "Screenshot"
+
+        out.append("")
+        out.append(f"> 📷 **Screenshot: {label}**")
+        out.append(">")
+
+        # ── Bild-Lookup: 6 Stufen ─────────────────────────────────────────────
+        entry = None
+
+        # Stufe 1+2: exakt / absolut via src & data-*-Attribute
+        if src:
+            entry = self._img_data.get(src)
+            if entry is None and self.base_url:
+                entry = self._img_data.get(urljoin(self.base_url, src))
+            if entry is None:
+                for attr in ("data-src", "data-lazy-src", "data-original"):
+                    val = el.get(attr, "")
+                    if val:
+                        entry = self._img_data.get(val)
+                        if entry is None and self.base_url:
+                            entry = self._img_data.get(urljoin(self.base_url, val))
+                        if entry:
+                            break
+
+        # Stufe 3: srcset-Attribute direkt am <img>
+        if entry is None:
+            for srcset_attr in ("srcset", "data-srcset"):
+                srcset_val = el.get(srcset_attr, "")
+                if srcset_val:
+                    for part in srcset_val.split(","):
+                        part_url = part.strip().split()[0] if part.strip() else ""
+                        if part_url and not part_url.startswith(("data:", "blob:")):
+                            entry = self._img_data.get(part_url)
+                            if entry is None and self.base_url:
+                                entry = self._img_data.get(urljoin(self.base_url, part_url))
+                            if entry:
+                                break
+                if entry:
                     break
-                self.log.emit(f"[SIM] [{i + 1}/{total}] {step_msg}")
-                time.sleep(delay / len(sub_steps))
 
-            if self.stop_event.is_set():
-                break
+        # Stufe 4: übergeordnetes <picture>-Element → <source srcset="…">
+        if entry is None and el.parent and el.parent.name == "picture":
+            for source in el.parent.find_all("source"):
+                for src_attr in ("srcset", "src"):
+                    sv = source.get(src_attr, "")
+                    for part in sv.split(","):
+                        part_url = part.strip().split()[0] if part.strip() else ""
+                        if part_url and not part_url.startswith(("data:", "blob:")):
+                            entry = self._img_data.get(part_url)
+                            if entry is None and self.base_url:
+                                entry = self._img_data.get(urljoin(self.base_url, part_url))
+                            if entry:
+                                break
+                    if entry:
+                        break
+                if entry:
+                    break
 
-            fname = url_to_filename(url)
-            fpath = out / fname
-            title = f"Simulierte Seite {i + 1}"
-            fpath.write_text(_dummy_md(url, title), encoding="utf-8")
-            index_entries.append((url, title, fname))
-            self.done.emit(str(fpath), title)
-            page_times.append(time.time() - t0)
+        # Stufe 5: data-scraper-idx – vom JS injiziertes Attribut (100 % zuverlässig)
+        if entry is None:
+            scraper_idx = el.get("data-scraper-idx")
+            if scraper_idx is not None:
+                try:
+                    entry = self._img_data.get(f"__pos_{int(scraper_idx)}")
+                except (ValueError, TypeError):
+                    pass
 
-        if index_entries:
-            lines = ["# Sitemap-Übersicht (Simulation)\n"]
-            for url, title, fname in index_entries:
-                lines.append(f"- [{title}]({fname}) — {url}")
-            (out / "_index.md").write_text("\n".join(lines), encoding="utf-8")
-
-        if self.stop_event.is_set():
-            self.finished_work.emit(
-                False, f"Abgebrochen nach {len(index_entries)} Seiten."
-            )
+        if entry:
+            b64, mime_type = entry
+            self._img_counter[0] += 1
+            n = self._img_counter[0]
+            total = self._img_total[0]
+            self._log(f"  Beschreibe Bild {n}/{total}: {label[:60]}…")
+            desc = self._describe_image(b64, mime_type, alt)
+            for line in desc.splitlines():
+                out.append(f"> {line}" if line else ">")
         else:
-            self.progress.emit("Fertig!", 100)
-            self.finished_work.emit(
-                True,
-                f"Simulation: {len(index_entries)} Seiten in {out}",
-            )
+            sidx = el.get("data-scraper-idx", "?")
+            reason = (f"scraper-idx={sidx} nicht in img_data"
+                      if sidx != "?" else "kein data-scraper-idx")
+            self._log(f"  [Bild übersprungen] {reason} · src='{(src or '')[:60]}'")
+            if alt:
+                out.append(f"> Alt-Text: {alt}")
+            elif src:
+                out.append(f"> Bild-URL: {src}")
+            else:
+                out.append("> [Bild ohne Quelle]")
 
+        out.append("")
 
-def _dummy_md(url: str, title: str) -> str:
-    return (
-        f"# {title}\n\n"
-        f"**URL:** {url}  \n"
-        f"**Erstellt:** {datetime.now().strftime('%Y-%m-%d %H:%M')}  \n"
-        f"**Modus:** Simulation\n\n"
-        "---\n\n"
-        "## Einleitung\n\n"
-        "Dies ist ein simulierter Inhalt für Test- und UI-Entwicklungszwecke.\n\n"
-        "## Abschnitt 1\n\n"
-        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
-        "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\n\n"
-        "## Abschnitt 2\n\n"
-        "- Punkt 1: Erster Listeneintrag\n"
-        "- Punkt 2: Zweiter Listeneintrag\n"
-        "- Punkt 3: Dritter Listeneintrag\n\n"
-        "## Tabelle\n\n"
-        "| Spalte A | Spalte B | Spalte C |\n"
-        "| --- | --- | --- |\n"
-        "| Wert 1 | Wert 2 | Wert 3 |\n"
-        "| Wert 4 | Wert 5 | Wert 6 |\n\n"
-        "## Code-Beispiel\n\n"
-        "```python\n"
-        "def hello():\n"
-        "    print('Hello, Website Scraper!')\n"
-        "```\n\n"
-        "> **NOTE**\n"
-        "> Dies ist eine simulierte Admonition-Box.\n\n"
-        "> 📷 **Screenshot: Beispielbild**\n"
-        "> _(Simulierte KI-Bildbeschreibung: Ein Screenshot der Webseite mit "
-        "Navigationselementen und Hauptinhalt.)_\n"
-    )
+    # ── KI-Bildbeschreibung ───────────────────────────────────────────────────
 
+    def _describe_image(self, b64: str, mime_type: str, alt: str) -> str:
+        provider = self.settings.get("provider", "openai")
+        api_key = get_api_key(provider)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — UI  (PyQt6, Dark Theme)
-# ══════════════════════════════════════════════════════════════════════════════
+        if not api_key:
+            return f"[Kein API-Key – Alt-Text: {alt}]" if alt else "[Kein API-Key konfiguriert]"
 
-_QSS = """
-/* ── Base ───────────────────────────────────────────────────────────────── */
-QWidget {
-    background-color: #1e1e2e;
-    color: #cdd6f4;
-    font-family: "Segoe UI", "Arial", sans-serif;
-    font-size: 13px;
-}
-QMainWindow { background-color: #181825; }
+        cache_key = b64[:64]
+        if cache_key in self._img_cache:
+            return self._img_cache[cache_key]
 
-/* ── Tabs ────────────────────────────────────────────────────────────────── */
-QTabWidget::pane {
-    border: 1px solid #313244;
-    background: #1e1e2e;
-    border-radius: 6px;
-}
-QTabBar::tab {
-    background: #313244;
-    color: #a6adc8;
-    padding: 8px 22px;
-    margin-right: 2px;
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-}
-QTabBar::tab:selected {
-    background: #89b4fa;
-    color: #1e1e2e;
-    font-weight: bold;
-}
-QTabBar::tab:hover:!selected { background: #45475a; color: #cdd6f4; }
-
-/* ── Buttons ─────────────────────────────────────────────────────────────── */
-QPushButton {
-    background-color: #89b4fa;
-    color: #1e1e2e;
-    border: none;
-    border-radius: 6px;
-    padding: 8px 18px;
-    font-weight: bold;
-    min-height: 32px;
-}
-QPushButton:hover   { background-color: #b4befe; }
-QPushButton:pressed { background-color: #74c7ec; }
-QPushButton:disabled { background-color: #45475a; color: #6c7086; }
-QPushButton#danger   { background-color: #f38ba8; color: #1e1e2e; }
-QPushButton#danger:hover { background-color: #fab387; }
-QPushButton#secondary    { background-color: #45475a; color: #cdd6f4; }
-QPushButton#secondary:hover { background-color: #585b70; }
-
-/* ── Inputs ──────────────────────────────────────────────────────────────── */
-QLineEdit, QTextEdit, QSpinBox, QComboBox {
-    background-color: #313244;
-    border: 1px solid #45475a;
-    border-radius: 6px;
-    padding: 6px 10px;
-    color: #cdd6f4;
-    selection-background-color: #89b4fa;
-    selection-color: #1e1e2e;
-}
-QLineEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus {
-    border: 1px solid #89b4fa;
-}
-QComboBox::drop-down { border: none; width: 24px; }
-QComboBox QAbstractItemView {
-    background: #313244;
-    border: 1px solid #45475a;
-    selection-background-color: #89b4fa;
-    selection-color: #1e1e2e;
-}
-QSpinBox::up-button, QSpinBox::down-button {
-    background: #45475a;
-    border: none;
-    border-radius: 3px;
-    width: 18px;
-}
-QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #585b70; }
-
-/* ── Progress bar ────────────────────────────────────────────────────────── */
-QProgressBar {
-    border: 1px solid #45475a;
-    border-radius: 6px;
-    background: #313244;
-    text-align: center;
-    color: #cdd6f4;
-    font-weight: bold;
-    min-height: 22px;
-}
-QProgressBar::chunk { background: #89b4fa; border-radius: 5px; }
-
-/* ── Checkbox ────────────────────────────────────────────────────────────── */
-QCheckBox { spacing: 8px; }
-QCheckBox::indicator {
-    width: 18px; height: 18px;
-    border: 2px solid #45475a;
-    border-radius: 4px;
-    background: #313244;
-}
-QCheckBox::indicator:checked { background: #89b4fa; border-color: #89b4fa; }
-
-/* ── Group box ───────────────────────────────────────────────────────────── */
-QGroupBox {
-    border: 1px solid #45475a;
-    border-radius: 8px;
-    margin-top: 14px;
-    padding: 8px 10px;
-    font-weight: bold;
-    color: #89b4fa;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 10px;
-    padding: 0 4px;
-}
-
-/* ── Scrollbar ───────────────────────────────────────────────────────────── */
-QScrollBar:vertical { background: #1e1e2e; width: 10px; border-radius: 5px; }
-QScrollBar::handle:vertical { background: #45475a; border-radius: 5px; min-height: 20px; }
-QScrollBar::handle:vertical:hover { background: #585b70; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-
-/* ── Custom labels ───────────────────────────────────────────────────────── */
-QLabel#status_lbl { color: #a6e3a1; font-size: 12px; }
-QLabel#eta_lbl    { color: #f9e2af; font-size: 12px; }
-QLabel#app_title  { font-size: 22px; font-weight: bold; color: #89b4fa; }
-QLabel#app_sub    { font-size: 12px; color: #6c7086; }
-
-/* ── Separator ───────────────────────────────────────────────────────────── */
-QFrame#separator { background: #313244; max-height: 1px; min-height: 1px; }
-
-/* ── Dialog ──────────────────────────────────────────────────────────────── */
-QDialog { background: #1e1e2e; }
-QDialogButtonBox QPushButton { min-width: 90px; }
-"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Reusable widgets
-# ─────────────────────────────────────────────────────────────────────────────
-
-class PathInputRow(QWidget):
-    """QLineEdit + optional folder-browse button."""
-
-    def __init__(
-        self, placeholder: str = "", browse: bool = False, parent=None
-    ) -> None:
-        super().__init__(parent)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        self.edit = QLineEdit()
-        self.edit.setPlaceholderText(placeholder)
-        lay.addWidget(self.edit)
-        if browse:
-            btn = QPushButton()
-            btn.setObjectName("secondary")
-            btn.setFixedSize(QSize(38, 34))
-            btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
-            btn.setIconSize(QSize(18, 18))
-            btn.setToolTip("Verzeichnis wählen")
-            btn.clicked.connect(self._browse)
-            lay.addWidget(btn)
-
-    def _browse(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Ausgabeverzeichnis wählen")
-        if path:
-            self.edit.setText(path)
-
-    @property
-    def text(self) -> str:
-        return self.edit.text().strip()
-
-    @text.setter
-    def text(self, v: str) -> None:
-        self.edit.setText(v)
-
-
-class ProgressPanel(QWidget):
-    """Status label + progress bar + ETA label + log view."""
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        lay = QVBoxLayout(self)
-        lay.setSpacing(6)
-        lay.setContentsMargins(0, 0, 0, 0)
-
-        self._status = QLabel("Bereit.")
-        self._status.setObjectName("status_lbl")
-
-        self._bar = QProgressBar()
-        self._bar.setValue(0)
-
-        self._eta = QLabel("")
-        self._eta.setObjectName("eta_lbl")
-
-        log_lbl = QLabel("📋 Protokoll:")
-        log_lbl.setStyleSheet("color:#6c7086;font-size:11px;")
-
-        self._log = QTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setFont(QFont("Consolas", 10))
-        self._log.setMinimumHeight(140)
-        self._log.setMaximumHeight(200)
-        self._log.setStyleSheet(
-            "background:#11111b;border:1px solid #313244;border-radius:6px;color:#a6adc8;"
+        prompt = (
+            "Beschreibe dieses Bild/Screenshot sehr detailliert auf Deutsch. "
+            "Nenne alle sichtbaren UI-Elemente, Texte, Feldbezeichnungen, Buttons, "
+            "Dropdown-Optionen, Einstellungen, Werte, Symbole und deren Bedeutung. "
+            "Beschreibe auch Layout und Struktur. Beginne direkt ohne Einleitung."
+            + (f" Alt-Text: {alt}" if alt else "")
         )
 
-        lay.addWidget(self._status)
-        lay.addWidget(self._bar)
-        lay.addWidget(self._eta)
-        lay.addWidget(log_lbl)
-        lay.addWidget(self._log)
+        try:
+            time.sleep(0.5)
+            if provider == "openai":
+                result = self._describe_openai(b64, mime_type, prompt)
+            else:
+                result = self._describe_gemini(b64, mime_type, prompt)
+            self._img_cache[cache_key] = result
+            return result
+        except Exception as exc:
+            self._log(f"  Bildbeschreibungs-Fehler: {exc}")
+            return f"[Bildbeschreibung fehlgeschlagen: {exc}]"
 
-    def update_progress(self, msg: str, pct: int) -> None:
-        self._status.setText(msg)
-        self._bar.setValue(max(0, min(100, pct)))
-
-    def update_eta(self, text: str) -> None:
-        self._eta.setText(text)
-
-    def append_log(self, msg: str) -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        self._log.append(f"<span style='color:#6c7086'>[{ts}]</span> {msg}")
-        self._log.moveCursor(QTextCursor.MoveOperation.End)
-
-    def reset(self) -> None:
-        self._status.setText("Bereit.")
-        self._bar.setValue(0)
-        self._eta.setText("")
-        self._log.clear()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Settings dialog
-# ─────────────────────────────────────────────────────────────────────────────
-
-class SettingsDialog(QDialog):
-    def __init__(self, settings: Settings, parent=None) -> None:
-        super().__init__(parent)
-        self.settings = settings
-        self.setWindowTitle("⚙  Einstellungen")
-        self.setMinimumSize(540, 560)
-        self._build()
-
-    def _build(self) -> None:
-        lay = QVBoxLayout(self)
-        lay.setSpacing(14)
-
-        # ── AI ────────────────────────────────────────────────────────────
-        ai_grp = QGroupBox("🤖 KI-Einstellungen")
-        ai_form = QFormLayout(ai_grp)
-        ai_form.setSpacing(10)
-
-        self._provider = QComboBox()
-        self._provider.addItems(["openai", "gemini"])
-        self._provider.setCurrentText(self.settings.get("ai_provider", "openai"))
-        self._provider.currentTextChanged.connect(self._toggle_models)
-        ai_form.addRow("Provider:", self._provider)
-
-        self._openai_mdl = QComboBox()
-        self._openai_mdl.addItems(["gpt-4o", "gpt-4o-mini"])
-        self._openai_mdl.setCurrentText(self.settings.get("openai_model", "gpt-4o"))
-        ai_form.addRow("OpenAI-Modell:", self._openai_mdl)
-
-        self._gemini_mdl = QComboBox()
-        self._gemini_mdl.addItems([
-            "gemini-2.0-flash", "gemini-2.0-flash-lite",
-            "gemini-1.5-flash", "gemini-1.5-pro",
-        ])
-        self._gemini_mdl.setCurrentText(
-            self.settings.get("gemini_model", "gemini-2.0-flash")
+    def _describe_openai(self, b64: str, mime_type: str, prompt: str) -> str:
+        import openai as _openai
+        client = _openai.OpenAI(api_key=get_api_key("openai"))
+        model = self.settings.get("openai_model", "gpt-4o")
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{b64}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }],
         )
-        ai_form.addRow("Gemini-Modell:", self._gemini_mdl)
+        return resp.choices[0].message.content
 
-        self._oai_key = QLineEdit()
-        self._oai_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._oai_key.setPlaceholderText("sk-…")
-        self._oai_key.setText(self.settings.get_api_key("openai"))
-        ai_form.addRow("OpenAI API-Key:", self._oai_key)
-
-        self._gem_key = QLineEdit()
-        self._gem_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._gem_key.setPlaceholderText("AIza…")
-        self._gem_key.setText(self.settings.get_api_key("gemini"))
-        ai_form.addRow("Gemini API-Key:", self._gem_key)
-
-        lay.addWidget(ai_grp)
-
-        # ── Scraper ───────────────────────────────────────────────────────
-        sc_grp = QGroupBox("🌐 Scraper-Einstellungen")
-        sc_form = QFormLayout(sc_grp)
-        sc_form.setSpacing(10)
-
-        self._headless = QCheckBox()
-        self._headless.setChecked(self.settings.get("browser_headless", True))
-        sc_form.addRow("Browser headless:", self._headless)
-
-        self._ai_imgs = QCheckBox()
-        self._ai_imgs.setChecked(self.settings.get("ai_describe_images", False))
-        sc_form.addRow("Bilder mit KI beschreiben:", self._ai_imgs)
-
-        self._max_imgs = QSpinBox()
-        self._max_imgs.setRange(1, 500)
-        self._max_imgs.setValue(self.settings.get("max_images_per_page", 30))
-        sc_form.addRow("Max. Bilder / Seite:", self._max_imgs)
-
-        lay.addWidget(sc_grp)
-
-        # ── Buttons ───────────────────────────────────────────────────────
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
+    def _describe_gemini(self, b64: str, mime_type: str, prompt: str) -> str:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=get_api_key("gemini"))
+        model_name = self.settings.get("gemini_model", "gemini-2.0-flash")
+        img_bytes = base64.b64decode(b64)
+        img_part = types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=[img_part, prompt],
         )
-        btns.accepted.connect(self._save)
-        btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
+        return resp.text
 
-        self._toggle_models(self._provider.currentText())
+    # ── Listeneinträge ────────────────────────────────────────────────────────
 
-    def _toggle_models(self, provider: str) -> None:
-        self._openai_mdl.setEnabled(provider == "openai")
-        self._gemini_mdl.setEnabled(provider == "gemini")
+    def _list_item(self, li, out: list, indent: int, ordered: bool, num):
+        from bs4 import Tag
+        prefix = "  " * indent
+        bullet = f"{num}." if ordered else "-"
 
-    def _save(self) -> None:
-        s = self.settings
-        s.set("ai_provider",        self._provider.currentText())
-        s.set("openai_model",       self._openai_mdl.currentText())
-        s.set("gemini_model",       self._gemini_mdl.currentText())
-        s.set("browser_headless",   self._headless.isChecked())
-        s.set("ai_describe_images", self._ai_imgs.isChecked())
-        s.set("max_images_per_page", self._max_imgs.value())
-        s.set_api_key("openai", self._oai_key.text().strip())
-        s.set_api_key("gemini", self._gem_key.text().strip())
-        s.save()
-        self.accept()
+        inline_parts: list = []
+        nested: list = []
+        block_els: list = []  # img / figure direkt im <li>
 
+        for ch in li.children:
+            if isinstance(ch, Tag) and ch.name in ("ul", "ol"):
+                nested.append(ch)
+            elif isinstance(ch, Tag) and ch.name in ("img", "figure"):
+                block_els.append(ch)
+            else:
+                inline_parts.append(self._inline(ch))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Tab: Einzelseite
-# ─────────────────────────────────────────────────────────────────────────────
+        text = "".join(inline_parts).strip()
+        if text:
+            out.append(f"{prefix}{bullet} {text}")
 
-class SinglePageTab(QWidget):
-    def __init__(self, settings: Settings, parent=None) -> None:
-        super().__init__(parent)
-        self.settings = settings
-        self._worker: SinglePageWorker | SimulationWorker | None = None
-        self._stop = threading.Event()
-        self._build()
+        # Bilder im Listeneintrag als Block unterhalb des Textes ausgeben
+        for bel in block_els:
+            if bel.name == "img":
+                self._img_block(bel, out)
+            else:  # figure
+                img = bel.find("img")
+                cap = bel.find("figcaption")
+                if img:
+                    self._img_block(img, out,
+                                    caption=self._inline(cap).strip() if cap else "")
 
-    def _build(self) -> None:
-        lay = QVBoxLayout(self)
-        lay.setSpacing(14)
-        lay.setContentsMargins(14, 14, 14, 14)
+        for sub in nested:
+            is_ord = sub.name == "ol"
+            for j, sub_li in enumerate(sub.find_all("li", recursive=False), 1):
+                self._list_item(sub_li, out, indent + 1, ordered=is_ord, num=j)
 
-        url_grp = QGroupBox("🔗 Ziel-URL")
-        url_lay = QVBoxLayout(url_grp)
-        self._url = PathInputRow("https://example.com/seite")
-        self._url.text = self.settings.get("single_url", "")
-        url_lay.addWidget(self._url)
-        lay.addWidget(url_grp)
+    # ── Tabellen ──────────────────────────────────────────────────────────────
 
-        out_grp = QGroupBox("📁 Ausgabeverzeichnis")
-        out_lay = QVBoxLayout(out_grp)
-        self._out = PathInputRow("C:\\Users\\…\\Desktop", browse=True)
-        self._out.text = self.settings.get(
-            "single_output_path", str(Path.home() / "Desktop")
-        )
-        out_lay.addWidget(self._out)
-        lay.addWidget(out_grp)
+    def _table(self, table, out: list):
+        rows: list = []
+        for tr in table.find_all("tr"):
+            cells = []
+            for cell in tr.find_all(["th", "td"]):
+                t = cell.get_text(" ", strip=True).replace("|", "\\|").replace("\n", " ")
+                cells.append(t)
+            if cells:
+                rows.append(cells)
 
-        btn_row = QHBoxLayout()
-        self._btn_start = QPushButton("▶  Starten")
-        self._btn_start.clicked.connect(self._start)
-        self._btn_stop = QPushButton("⏹  Abbrechen")
-        self._btn_stop.setObjectName("danger")
-        self._btn_stop.setEnabled(False)
-        self._btn_stop.clicked.connect(self._cancel)
-        self._btn_sim = QPushButton("🔬  Simulation")
-        self._btn_sim.setObjectName("secondary")
-        self._btn_sim.clicked.connect(self._simulate)
-        btn_row.addWidget(self._btn_start)
-        btn_row.addWidget(self._btn_stop)
-        btn_row.addWidget(self._btn_sim)
-        lay.addLayout(btn_row)
-
-        self._prog = ProgressPanel()
-        lay.addWidget(self._prog)
-        lay.addStretch()
-
-    def _save_state(self) -> None:
-        self.settings.set("single_url", self._url.text)
-        self.settings.set("single_output_path", self._out.text)
-        self.settings.set("last_mode", "single")
-        self.settings.save()
-
-    def _lock(self) -> None:
-        self._btn_start.setEnabled(False)
-        self._btn_sim.setEnabled(False)
-        self._btn_stop.setEnabled(True)
-
-    def _unlock(self) -> None:
-        self._btn_start.setEnabled(True)
-        self._btn_sim.setEnabled(True)
-        self._btn_stop.setEnabled(False)
-
-    def _start(self) -> None:
-        url, out = self._url.text, self._out.text
-        if not url:
-            QMessageBox.warning(self, "Fehler", "Bitte eine URL eingeben.")
+        if not rows:
             return
-        if not out:
-            QMessageBox.warning(self, "Fehler", "Bitte ein Ausgabeverzeichnis angeben.")
-            return
-        self._save_state()
-        self._stop = threading.Event()
-        self._prog.reset()
-        self._lock()
 
-        self._worker = SinglePageWorker(url, out, self.settings, self._stop)
-        self._worker.progress.connect(self._prog.update_progress)
-        self._worker.log.connect(self._prog.append_log)
-        self._worker.done.connect(
-            lambda fp, _t: self._prog.append_log(f"✅ Gespeichert: {fp}")
-        )
-        self._worker.finished_work.connect(self._on_finish)
-        self._worker.start()
+        ncols = max(len(r) for r in rows)
+        for r in rows:
+            while len(r) < ncols:
+                r.append("")
 
-    def _simulate(self) -> None:
-        url = self._url.text or "https://beispiel.de/seite"
-        out = self._out.text or str(Path.home() / "Desktop")
-        self._save_state()
-        self._stop = threading.Event()
-        self._prog.reset()
-        self._lock()
-
-        self._worker = SimulationWorker("single", url, out, self._stop)
-        self._worker.progress.connect(self._prog.update_progress)
-        self._worker.log.connect(self._prog.append_log)
-        self._worker.done.connect(
-            lambda fp, _t: self._prog.append_log(f"✅ Gespeichert: {fp}")
-        )
-        self._worker.finished_work.connect(self._on_finish)
-        self._worker.start()
-
-    def _cancel(self) -> None:
-        self._stop.set()
-        self._prog.append_log("⚠ Abbruch angefordert …")
-
-    def _on_finish(self, ok: bool, msg: str) -> None:
-        self._unlock()
-        icon = "✅" if ok else "⚠"
-        self._prog.update_progress(f"{icon} {msg}", 100 if ok else 0)
-        self._prog.append_log(f"{icon} {msg}")
+        out.append("")
+        for i, row in enumerate(rows):
+            out.append("| " + " | ".join(row) + " |")
+            if i == 0:
+                out.append("| " + " | ".join(["---"] * ncols) + " |")
+        out.append("")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Tab: Sitemap
-# ─────────────────────────────────────────────────────────────────────────────
-
-class SitemapTab(QWidget):
-    def __init__(self, settings: Settings, parent=None) -> None:
-        super().__init__(parent)
-        self.settings = settings
-        self._worker: SitemapWorker | SimulationWorker | None = None
-        self._stop = threading.Event()
-        self._build()
-
-    def _build(self) -> None:
-        lay = QVBoxLayout(self)
-        lay.setSpacing(14)
-        lay.setContentsMargins(14, 14, 14, 14)
-
-        url_grp = QGroupBox("🗺  Sitemap-URL")
-        url_lay = QVBoxLayout(url_grp)
-        self._url = PathInputRow("https://example.com/sitemap.xml")
-        self._url.text = self.settings.get("sitemap_url", "")
-        url_lay.addWidget(self._url)
-        lay.addWidget(url_grp)
-
-        out_grp = QGroupBox("📁 Ausgabeverzeichnis")
-        out_lay = QVBoxLayout(out_grp)
-        self._out = PathInputRow("C:\\Users\\…\\Desktop", browse=True)
-        self._out.text = self.settings.get(
-            "sitemap_output_path", str(Path.home() / "Desktop")
-        )
-        out_lay.addWidget(self._out)
-        lay.addWidget(out_grp)
-
-        btn_row = QHBoxLayout()
-        self._btn_start = QPushButton("▶  Starten")
-        self._btn_start.clicked.connect(self._start)
-        self._btn_stop = QPushButton("⏹  Abbrechen")
-        self._btn_stop.setObjectName("danger")
-        self._btn_stop.setEnabled(False)
-        self._btn_stop.clicked.connect(self._cancel)
-        self._btn_sim = QPushButton("🔬  Simulation")
-        self._btn_sim.setObjectName("secondary")
-        self._btn_sim.clicked.connect(self._simulate)
-        btn_row.addWidget(self._btn_start)
-        btn_row.addWidget(self._btn_stop)
-        btn_row.addWidget(self._btn_sim)
-        lay.addLayout(btn_row)
-
-        self._prog = ProgressPanel()
-        lay.addWidget(self._prog)
-        lay.addStretch()
-
-    def _save_state(self) -> None:
-        self.settings.set("sitemap_url", self._url.text)
-        self.settings.set("sitemap_output_path", self._out.text)
-        self.settings.set("last_mode", "sitemap")
-        self.settings.save()
-
-    def _lock(self) -> None:
-        self._btn_start.setEnabled(False)
-        self._btn_sim.setEnabled(False)
-        self._btn_stop.setEnabled(True)
-
-    def _unlock(self) -> None:
-        self._btn_start.setEnabled(True)
-        self._btn_sim.setEnabled(True)
-        self._btn_stop.setEnabled(False)
-
-    def _start(self) -> None:
-        url, out = self._url.text, self._out.text
-        if not url:
-            QMessageBox.warning(self, "Fehler", "Bitte eine Sitemap-URL eingeben.")
-            return
-        if not out:
-            QMessageBox.warning(self, "Fehler", "Bitte ein Ausgabeverzeichnis angeben.")
-            return
-        self._save_state()
-        self._stop = threading.Event()
-        self._prog.reset()
-        self._lock()
-
-        self._worker = SitemapWorker(url, out, self.settings, self._stop)
-        self._worker.progress.connect(self._prog.update_progress)
-        self._worker.eta_update.connect(self._prog.update_eta)
-        self._worker.log.connect(self._prog.append_log)
-        self._worker.done.connect(
-            lambda fp, title: self._prog.append_log(f"✅ {title}")
-        )
-        self._worker.finished_work.connect(self._on_finish)
-        self._worker.start()
-
-    def _simulate(self) -> None:
-        url = self._url.text or "https://beispiel.de/sitemap.xml"
-        out = self._out.text or str(Path.home() / "Desktop")
-        self._save_state()
-        self._stop = threading.Event()
-        self._prog.reset()
-        self._lock()
-
-        self._worker = SimulationWorker("sitemap", url, out, self._stop)
-        self._worker.progress.connect(self._prog.update_progress)
-        self._worker.eta_update.connect(self._prog.update_eta)
-        self._worker.log.connect(self._prog.append_log)
-        self._worker.done.connect(
-            lambda fp, title: self._prog.append_log(f"✅ {title}")
-        )
-        self._worker.finished_work.connect(self._on_finish)
-        self._worker.start()
-
-    def _cancel(self) -> None:
-        self._stop.set()
-        self._prog.append_log("⚠ Abbruch angefordert …")
-
-    def _on_finish(self, ok: bool, msg: str) -> None:
-        self._unlock()
-        icon = "✅" if ok else "⚠"
-        self._prog.update_progress(f"{icon} {msg}", 100 if ok else 0)
-        self._prog.append_log(f"{icon} {msg}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main window
-# ─────────────────────────────────────────────────────────────────────────────
-
-class MainWindow(QMainWindow):
-    def __init__(self, settings: Settings) -> None:
-        super().__init__()
-        self.settings = settings
-        self.setWindowTitle("🌐 Website Scraper")
-        self.setMinimumSize(740, 680)
-        self.resize(880, 760)
-        self._build()
-        self._restore_tab()
-
-    def _build(self) -> None:
-        root = QWidget()
-        self.setCentralWidget(root)
-        root_lay = QVBoxLayout(root)
-        root_lay.setSpacing(0)
-        root_lay.setContentsMargins(0, 0, 0, 0)
-
-        # ── Header ────────────────────────────────────────────────────────
-        header = QWidget()
-        header.setStyleSheet("background:#181825;")
-        header.setFixedHeight(68)
-        h_lay = QHBoxLayout(header)
-        h_lay.setContentsMargins(20, 10, 20, 10)
-
-        title = QLabel("🌐  Website Scraper")
-        title.setObjectName("app_title")
-        sub = QLabel("HTML → Markdown Konverter  •  PyQt6  •  Dark Mode")
-        sub.setObjectName("app_sub")
-
-        col = QVBoxLayout()
-        col.setSpacing(2)
-        col.addWidget(title)
-        col.addWidget(sub)
-        h_lay.addLayout(col)
-        h_lay.addStretch()
-
-        cfg_btn = QPushButton("⚙  Einstellungen")
-        cfg_btn.setObjectName("secondary")
-        cfg_btn.setFixedWidth(150)
-        cfg_btn.clicked.connect(self._open_settings)
-        h_lay.addWidget(cfg_btn)
-
-        root_lay.addWidget(header)
-
-        sep = QFrame()
-        sep.setObjectName("separator")
-        root_lay.addWidget(sep)
-
-        # ── Content ───────────────────────────────────────────────────────
-        content = QWidget()
-        c_lay = QVBoxLayout(content)
-        c_lay.setContentsMargins(16, 16, 16, 16)
-
-        self.tabs = QTabWidget()
-        self._tab_single = SinglePageTab(self.settings)
-        self._tab_sitemap = SitemapTab(self.settings)
-        self.tabs.addTab(self._tab_single, "📄  Einzelseite")
-        self.tabs.addTab(self._tab_sitemap, "🗺  Sitemap")
-        c_lay.addWidget(self.tabs)
-        root_lay.addWidget(content)
-
-        # ── Status bar ────────────────────────────────────────────────────
-        sb = self.statusBar()
-        sb.showMessage("Bereit — Website Scraper v1.0  |  PyQt6")
-        sb.setStyleSheet("background:#181825;color:#6c7086;font-size:11px;")
-
-    def _restore_tab(self) -> None:
-        if self.settings.get("last_mode") == "sitemap":
-            self.tabs.setCurrentIndex(1)
-        else:
-            self.tabs.setCurrentIndex(0)
-
-    def _open_settings(self) -> None:
-        dlg = SettingsDialog(self.settings, self)
-        if dlg.exec():
-            self.statusBar().showMessage("Einstellungen gespeichert.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — MAIN
-# ══════════════════════════════════════════════════════════════════════════════
-
-def main() -> None:
-    settings = Settings()
-
-    app: QApplication = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("Website Scraper")
-    app.setStyleSheet(_QSS)
-
-    # Enable high-DPI icons
-    try:
-        app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
-    except AttributeError:
-        pass
-
-    window = MainWindow(settings)
-    window.show()
-    sys.exit(app.exec())
-
+# ─── Einstiegspunkt ───────────────────────────────────────────────────────────
+# SettingsDialog und App werden erst nach ensure_dependencies() definiert,
+# damit customtkinter beim ersten Start automatisch installiert werden kann.
 
 if __name__ == "__main__":
-    main()
+    ensure_dependencies()
+
+    import customtkinter as ctk
+    ctk.set_appearance_mode(load_settings().get("appearance", "dark"))
+    ctk.set_default_color_theme("blue")
+
+    # ── Einstellungs-Dialog ───────────────────────────────────────────────────
+
+    # ── FormatEditorDialog ────────────────────────────────────────────────────
+
+    class FormatEditorDialog(ctk.CTkToplevel):
+        """Dialog zum Anlegen und Bearbeiten eines Ausgabeformats."""
+
+        def __init__(self, parent, fmt: dict):
+            super().__init__(parent)
+            self._fmt   = dict(fmt)
+            self.result = None
+            title_txt   = "Format bearbeiten" if fmt.get("id") else "Neues Format"
+            self.title(title_txt)
+            self.geometry("600x580")
+            self.minsize(560, 420)
+            self.transient(parent)
+            self.grab_set()
+            self.lift()
+            self.focus_force()
+            self._build_ui()
+            self._load_values()
+            self.wait_window()
+
+        def _build_ui(self):
+            self.columnconfigure(0, weight=1)
+            self.rowconfigure(1, weight=1)
+
+            ctk.CTkLabel(
+                self,
+                text=("✏️  Format bearbeiten" if self._fmt.get("id")
+                      else "➕  Neues Format anlegen"),
+                font=ctk.CTkFont(size=16, weight="bold"), anchor="w",
+            ).grid(row=0, column=0, sticky="w", padx=20, pady=(16, 8))
+
+            scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+            scroll.grid(row=1, column=0, sticky="nsew", padx=12, pady=0)
+            scroll.columnconfigure(1, weight=1)
+
+            r = 0
+
+            # ── Name ──
+            ctk.CTkLabel(scroll, text="Name", anchor="w").grid(
+                row=r, column=0, sticky="w", padx=8, pady=(8, 4))
+            self._name_var = tk.StringVar()
+            ctk.CTkEntry(scroll, textvariable=self._name_var,
+                         placeholder_text="z. B. Jira-Markdown").grid(
+                row=r, column=1, sticky="ew", padx=(8, 4), pady=(8, 4))
+            r += 1
+
+            # ── Typ + Dateiendung ──
+            ctk.CTkLabel(scroll, text="Typ", anchor="w").grid(
+                row=r, column=0, sticky="w", padx=8, pady=4)
+            type_row = ctk.CTkFrame(scroll, fg_color="transparent")
+            type_row.grid(row=r, column=1, sticky="ew", padx=(8, 4), pady=4)
+            self._type_var = tk.StringVar()
+            ctk.CTkComboBox(
+                type_row, variable=self._type_var,
+                values=["Markdown", "XML", "CSV"],
+                width=150, state="readonly",
+                command=self._on_type_change,
+            ).pack(side="left")
+            ctk.CTkLabel(type_row, text="  Dateiendung:", anchor="w").pack(
+                side="left", padx=(14, 4))
+            self._ext_var = tk.StringVar()
+            ctk.CTkEntry(type_row, textvariable=self._ext_var, width=72).pack(
+                side="left")
+            r += 1
+
+            ctk.CTkFrame(scroll, height=1, fg_color="gray35").grid(
+                row=r, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
+            r += 1
+
+            # ── Template (Markdown/XML) ──
+            self._tpl_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+            self._tpl_frame.grid(row=r, column=0, columnspan=2, sticky="ew")
+            self._tpl_frame.columnconfigure(0, weight=1)
+            ctk.CTkLabel(
+                self._tpl_frame,
+                text="📝  Template  (leer = Standard-Ausgabe)",
+                font=ctk.CTkFont(weight="bold"), anchor="w",
+            ).grid(row=0, column=0, sticky="w", padx=8, pady=(0, 2))
+            ctk.CTkLabel(
+                self._tpl_frame,
+                text="Platzhalter:  {{title}}  {{url}}  {{content}}"
+                     "  {{text}}  {{meta_description}}  {{date}}",
+                font=ctk.CTkFont(size=10), text_color="gray55", anchor="w",
+            ).grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+            self._tpl_box = ctk.CTkTextbox(
+                self._tpl_frame,
+                font=ctk.CTkFont(family="Consolas", size=10),
+                height=120, corner_radius=6,
+            )
+            self._tpl_box.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+            r += 1
+
+            # ── Felder (XML/CSV) ──
+            self._fld_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+            self._fld_frame.grid(row=r, column=0, columnspan=2, sticky="ew")
+            ctk.CTkLabel(
+                self._fld_frame,
+                text="📋  Felder",
+                font=ctk.CTkFont(weight="bold"), anchor="w",
+            ).grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 4))
+            self._field_vars: dict = {}
+            _field_labels = {
+                "title": "Titel",
+                "url": "URL",
+                "content": "Inhalt (Markdown)",
+                "text": "Text (Plain)",
+                "meta_description": "Meta-Beschreibung",
+                "date": "Datum",
+                "images_count": "Bilder-Anzahl",
+            }
+            for idx, fld in enumerate(ALL_FORMAT_FIELDS):
+                v = tk.BooleanVar(value=False)
+                self._field_vars[fld] = v
+                ctk.CTkCheckBox(
+                    self._fld_frame,
+                    text=_field_labels.get(fld, fld),
+                    variable=v,
+                ).grid(row=1 + idx // 2, column=idx % 2, sticky="w",
+                       padx=(8, 24), pady=2)
+            r += 1
+
+            # ── CSV-Parameter ──
+            self._csv_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+            self._csv_frame.grid(row=r, column=0, columnspan=2, sticky="ew")
+            ctk.CTkLabel(
+                self._csv_frame,
+                text="⚙  CSV-Parameter",
+                font=ctk.CTkFont(weight="bold"), anchor="w",
+            ).grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 4))
+            ctk.CTkLabel(
+                self._csv_frame, text="Trennzeichen:", anchor="w",
+            ).grid(row=1, column=0, sticky="w", padx=8, pady=2)
+            self._delim_var = tk.StringVar(value=",")
+            ctk.CTkEntry(
+                self._csv_frame, textvariable=self._delim_var, width=48,
+            ).grid(row=1, column=1, sticky="w", padx=4, pady=2)
+            ctk.CTkLabel(
+                self._csv_frame, text="Anführungszeichen:", anchor="w",
+            ).grid(row=1, column=2, sticky="w", padx=(16, 4), pady=2)
+            self._quote_var = tk.StringVar(value='"')
+            ctk.CTkEntry(
+                self._csv_frame, textvariable=self._quote_var, width=48,
+            ).grid(row=1, column=3, sticky="w", padx=4, pady=2)
+            self._header_var = tk.BooleanVar(value=True)
+            ctk.CTkCheckBox(
+                self._csv_frame, text="Kopfzeile einschließen",
+                variable=self._header_var,
+            ).grid(row=2, column=0, columnspan=4, sticky="w", padx=8, pady=4)
+            r += 1
+
+            # ── XML-Parameter ──
+            self._xml_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+            self._xml_frame.grid(row=r, column=0, columnspan=2, sticky="ew")
+            ctk.CTkLabel(
+                self._xml_frame,
+                text="⚙  XML-Parameter",
+                font=ctk.CTkFont(weight="bold"), anchor="w",
+            ).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 4))
+            ctk.CTkLabel(
+                self._xml_frame, text="Wurzelelement:", anchor="w",
+            ).grid(row=1, column=0, sticky="w", padx=8, pady=2)
+            self._root_var = tk.StringVar(value="page")
+            ctk.CTkEntry(
+                self._xml_frame, textvariable=self._root_var, width=120,
+            ).grid(row=1, column=1, sticky="w", padx=4, pady=2)
+
+            # ── Buttons ──
+            btn_row = ctk.CTkFrame(self, fg_color="transparent")
+            btn_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(8, 16))
+            ctk.CTkButton(
+                btn_row, text="Speichern", command=self._save,
+                width=120, height=34,
+            ).pack(side="left", padx=(0, 8))
+            ctk.CTkButton(
+                btn_row, text="Abbrechen", command=self.destroy,
+                width=110, height=34,
+                fg_color="transparent", border_width=1,
+                text_color=("gray10", "gray90"),
+            ).pack(side="left")
+
+        def _on_type_change(self, val=None):
+            if val is None:
+                val = self._type_var.get()
+            t = {"Markdown": "markdown", "XML": "xml", "CSV": "csv"}.get(
+                val, "markdown")
+            for widget, show in [
+                (self._tpl_frame, t in ("markdown", "xml")),
+                (self._fld_frame, t in ("xml", "csv")),
+                (self._csv_frame, t == "csv"),
+                (self._xml_frame, t == "xml"),
+            ]:
+                if show:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            if not self._ext_var.get().strip():
+                self._ext_var.set(
+                    {"markdown": ".md", "xml": ".xml", "csv": ".csv"}[t])
+
+        def _load_values(self):
+            fmt = self._fmt
+            self._name_var.set(fmt.get("name", ""))
+            _type_map = {"markdown": "Markdown", "xml": "XML", "csv": "CSV"}
+            self._type_var.set(
+                _type_map.get(fmt.get("type", "markdown"), "Markdown"))
+            self._ext_var.set(fmt.get("extension", ""))
+            tpl = fmt.get("template", "")
+            self._tpl_box.delete("1.0", tk.END)
+            if tpl:
+                self._tpl_box.insert("1.0", tpl)
+            for fld, var in self._field_vars.items():
+                var.set(fld in fmt.get("fields", []))
+            params = fmt.get("params", {})
+            self._delim_var.set(params.get("delimiter", ","))
+            self._quote_var.set(params.get("quotechar", '"'))
+            self._header_var.set(params.get("include_header", True))
+            self._root_var.set(params.get("root_element", "page"))
+            self._on_type_change()
+
+        def _save(self):
+            name = self._name_var.get().strip()
+            if not name:
+                messagebox.showwarning(
+                    "Hinweis", "Bitte einen Namen eingeben.", parent=self)
+                return
+            self.result = self._collect()
+            self.destroy()
+
+        def _collect(self) -> dict:
+            _type_map = {"Markdown": "markdown", "XML": "xml", "CSV": "csv"}
+            t      = _type_map.get(self._type_var.get(), "markdown")
+            fields = [f for f, v in self._field_vars.items() if v.get()]
+            params: dict = {}
+            if t == "csv":
+                params = {
+                    "delimiter":      self._delim_var.get() or ",",
+                    "quotechar":      self._quote_var.get() or '"',
+                    "include_header": self._header_var.get(),
+                }
+            elif t == "xml":
+                params = {"root_element": self._root_var.get() or "page"}
+            ext    = self._ext_var.get().strip() or f".{t}"
+            tpl    = (self._tpl_box.get("1.0", tk.END).strip()
+                      if t != "csv" else "")
+            fmt_id = self._fmt.get("id") or f"fmt_{int(time.time())}"
+            return {
+                "id":        fmt_id,
+                "name":      self._name_var.get().strip(),
+                "type":      t,
+                "extension": ext,
+                "template":  tpl,
+                "fields":    fields,
+                "params":    params,
+                "builtin":   self._fmt.get("builtin", False),
+            }
+
+    # ── SettingsDialog ────────────────────────────────────────────────────────
+
+    class SettingsDialog(ctk.CTkToplevel):
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.title("Einstellungen")
+            self.geometry("640x600")
+            self.resizable(False, False)
+            self.transient(parent)
+            self.grab_set()
+            self.lift()
+            self.focus_force()
+            self._build_ui()
+            self._load_values()
+            self.wait_window()
+
+        def _build_ui(self):
+            ctk.CTkLabel(
+                self, text="⚙  Einstellungen",
+                font=ctk.CTkFont(size=18, weight="bold"), anchor="w",
+            ).pack(padx=20, pady=(18, 8), fill="x")
+
+            tabs = ctk.CTkTabview(self, height=350)
+            tabs.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+            ai      = tabs.add("🤖  KI & API")
+            sc      = tabs.add("🔧  Scraper")
+            fmt_tab = tabs.add("📋  Formate")
+
+            # ── KI-Tab ────────────────────────────────────────────────────────
+            ai.columnconfigure(1, weight=1)
+
+            row = 0
+            ctk.CTkLabel(ai, text="AI-Provider", anchor="w").grid(
+                row=row, column=0, sticky="w", padx=8, pady=8)
+            self._prov_var = tk.StringVar()
+            ctk.CTkComboBox(ai, variable=self._prov_var,
+                            values=["openai", "gemini"], width=180).grid(
+                row=row, column=1, sticky="w", padx=8, pady=8)
+            row += 1
+
+            ctk.CTkLabel(ai, text="OpenAI API-Key",
+                         font=ctk.CTkFont(weight="bold"), anchor="w").grid(
+                row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(12, 2))
+            row += 1
+            self._oai_var = tk.StringVar()
+            oai_e = ctk.CTkEntry(ai, textvariable=self._oai_var, show="*", width=390)
+            oai_e.grid(row=row, column=0, columnspan=2, sticky="ew", padx=8)
+            row += 1
+            self._oai_show = tk.BooleanVar()
+            ctk.CTkCheckBox(
+                ai, text="Key anzeigen", variable=self._oai_show,
+                command=lambda: oai_e.configure(show="" if self._oai_show.get() else "*"),
+            ).grid(row=row, column=0, sticky="w", padx=8, pady=4)
+            row += 1
+
+            ctk.CTkLabel(ai, text="Modell", anchor="w").grid(
+                row=row, column=0, sticky="w", padx=8, pady=6)
+            self._oai_model_var = tk.StringVar()
+            ctk.CTkComboBox(ai, variable=self._oai_model_var,
+                            values=["gpt-4o", "gpt-4o-mini"], width=180).grid(
+                row=row, column=1, sticky="w", padx=8, pady=6)
+            row += 1
+
+            ctk.CTkFrame(ai, height=1, fg_color="gray35").grid(
+                row=row, column=0, columnspan=2, sticky="ew", padx=8, pady=10)
+            row += 1
+
+            ctk.CTkLabel(ai, text="Gemini API-Key",
+                         font=ctk.CTkFont(weight="bold"), anchor="w").grid(
+                row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2))
+            row += 1
+            self._gem_var = tk.StringVar()
+            gem_e = ctk.CTkEntry(ai, textvariable=self._gem_var, show="*", width=390)
+            gem_e.grid(row=row, column=0, columnspan=2, sticky="ew", padx=8)
+            row += 1
+            self._gem_show = tk.BooleanVar()
+            ctk.CTkCheckBox(
+                ai, text="Key anzeigen", variable=self._gem_show,
+                command=lambda: gem_e.configure(show="" if self._gem_show.get() else "*"),
+            ).grid(row=row, column=0, sticky="w", padx=8, pady=4)
+            row += 1
+
+            ctk.CTkLabel(ai, text="Modell", anchor="w").grid(
+                row=row, column=0, sticky="w", padx=8, pady=6)
+            self._gem_model_var = tk.StringVar()
+            ctk.CTkComboBox(
+                ai, variable=self._gem_model_var,
+                values=["gemini-2.0-flash", "gemini-2.0-flash-lite",
+                        "gemini-1.5-flash", "gemini-1.5-pro"],
+                width=200,
+            ).grid(row=row, column=1, sticky="w", padx=8, pady=6)
+
+            # ── Scraper-Tab ───────────────────────────────────────────────────
+            self._desc_var = tk.BooleanVar()
+            ctk.CTkCheckBox(sc, text="Bilder mit AI beschreiben",
+                            variable=self._desc_var).pack(anchor="w", padx=8, pady=(16, 8))
+
+            self._headless_var = tk.BooleanVar()
+            ctk.CTkCheckBox(sc, text="Browser unsichtbar (Headless-Modus)",
+                            variable=self._headless_var).pack(anchor="w", padx=8, pady=8)
+
+            max_row = ctk.CTkFrame(sc, fg_color="transparent")
+            max_row.pack(anchor="w", padx=8, pady=(16, 8))
+            ctk.CTkLabel(max_row, text="Max. Bilder pro Seite:").pack(side="left")
+            self._max_var = tk.IntVar(value=30)
+            ctk.CTkEntry(max_row, textvariable=self._max_var, width=72).pack(
+                side="left", padx=(10, 8))
+            ctk.CTkLabel(max_row, text="(je Bild ca. 1–3 API-Calls)",
+                         text_color="gray55",
+                         font=ctk.CTkFont(size=11)).pack(side="left")
+
+            ctk.CTkFrame(sc, height=1, fg_color="gray35").pack(
+                fill="x", padx=8, pady=(18, 10))
+
+            # ── GitHub Update-Token ───────────────────────────────────────────
+            ctk.CTkLabel(sc, text="GitHub Update-Token",
+                         font=ctk.CTkFont(weight="bold"), anchor="w").pack(
+                anchor="w", padx=8, pady=(0, 2))
+            self._gh_token_var = tk.StringVar()
+            gh_e = ctk.CTkEntry(sc, textvariable=self._gh_token_var,
+                                show="*", width=390)
+            gh_e.pack(anchor="w", padx=8)
+            self._gh_show = tk.BooleanVar()
+            ctk.CTkCheckBox(
+                sc, text="Token anzeigen", variable=self._gh_show,
+                command=lambda: gh_e.configure(
+                    show="" if self._gh_show.get() else "*"),
+            ).pack(anchor="w", padx=8, pady=(4, 0))
+            ctk.CTkLabel(
+                sc,
+                text="Fine-grained PAT: Repository-Permission 'Contents: Read-only' genügt",
+                font=ctk.CTkFont(size=10), text_color="gray55", anchor="w",
+            ).pack(anchor="w", padx=8, pady=(2, 0))
+
+            ctk.CTkFrame(sc, height=1, fg_color="gray35").pack(
+                fill="x", padx=8, pady=(14, 14))
+
+            appear_row = ctk.CTkFrame(sc, fg_color="transparent")
+            appear_row.pack(anchor="w", padx=8, pady=(0, 8))
+            ctk.CTkLabel(appear_row, text="Erscheinungsbild:").pack(side="left", padx=(0, 14))
+            self._appear_var = tk.StringVar(value="dark")
+            ctk.CTkSegmentedButton(
+                appear_row,
+                values=["🌙  Dark", "☀️  Light", "🖥  System"],
+                variable=self._appear_var,
+                width=280,
+            ).pack(side="left")
+
+            self._build_formats_tab(fmt_tab)
+
+            # ── Buttons ───────────────────────────────────────────────────────
+            btn_row = ctk.CTkFrame(self, fg_color="transparent")
+            btn_row.pack(padx=16, pady=(0, 18), fill="x")
+            ctk.CTkButton(btn_row, text="Speichern", command=self._save,
+                          width=130, height=34).pack(side="left", padx=(0, 8))
+            ctk.CTkButton(
+                btn_row, text="Abbrechen", command=self.destroy,
+                width=110, height=34,
+                fg_color="transparent", border_width=1,
+                text_color=("gray10", "gray90"),
+            ).pack(side="left")
+
+        def _load_values(self):
+            s = load_settings()
+            self._prov_var.set(s.get("provider", "openai"))
+            self._oai_model_var.set(s.get("openai_model", "gpt-4o"))
+            self._gem_model_var.set(s.get("gemini_model", "gemini-2.0-flash"))
+            self._desc_var.set(s.get("describe_images", True))
+            self._headless_var.set(s.get("headless", True))
+            self._max_var.set(s.get("max_images", 30))
+            self._gh_token_var.set(get_api_key("github"))
+            # Erscheinungsbild: intern "dark"/"light"/"system" → Label mit Emoji
+            _mode_to_label = {"dark": "🌙  Dark", "light": "☀️  Light", "system": "🖥  System"}
+            self._appear_var.set(_mode_to_label.get(s.get("appearance", "dark"), "🌙  Dark"))
+            self._oai_var.set(get_api_key("openai"))
+            self._gem_var.set(get_api_key("gemini"))
+
+        def _save(self):
+            s = load_settings()
+            s["provider"] = self._prov_var.get()
+            s["openai_model"] = self._oai_model_var.get()
+            s["gemini_model"] = self._gem_model_var.get()
+            s["describe_images"] = self._desc_var.get()
+            s["headless"] = self._headless_var.get()
+            try:
+                s["max_images"] = int(self._max_var.get())
+            except (ValueError, tk.TclError):
+                s["max_images"] = 30
+            # Erscheinungsbild: Label → interner Schlüssel
+            _label_to_mode = {"🌙  Dark": "dark", "☀️  Light": "light", "🖥  System": "system"}
+            appearance = _label_to_mode.get(self._appear_var.get(), "dark")
+            s["appearance"] = appearance
+            save_settings(s)
+            oai = self._oai_var.get().strip()
+            gem = self._gem_var.get().strip()
+            gh  = self._gh_token_var.get().strip()
+            if oai:
+                set_api_key("openai", oai)
+            if gem:
+                set_api_key("gemini", gem)
+            if gh:
+                set_api_key("github", gh)
+            # Modus sofort anwenden (kein Neustart nötig)
+            ctk.set_appearance_mode(appearance)
+            messagebox.showinfo("Einstellungen", "Gespeichert.", parent=self)
+            self.destroy()
+
+        # ── Formate-Tab ───────────────────────────────────────────────────────
+
+        def _build_formats_tab(self, frame):
+            """Baut den Inhalt des Formate-Tabs (wird auch beim Reload aufgerufen)."""
+            self._fmt_tab_frame = frame
+            for w in frame.winfo_children():
+                w.destroy()
+            frame.columnconfigure(0, weight=1)
+
+            ctk.CTkLabel(
+                frame,
+                text="Ausgabeformat für Extraktionen:",
+                font=ctk.CTkFont(weight="bold"), anchor="w",
+            ).grid(row=0, column=0, sticky="w", padx=8, pady=(12, 6))
+
+            fmts     = get_formats()
+            s        = load_settings()
+            active_id = s.get("active_format", "builtin_md")
+            self._fmt_radio_var = tk.StringVar(value=active_id)
+
+            for i, fmt in enumerate(fmts):
+                row_frame = ctk.CTkFrame(frame, fg_color="transparent")
+                row_frame.grid(row=i + 1, column=0, sticky="ew", padx=4, pady=2)
+                row_frame.columnconfigure(0, weight=1)
+
+                ctk.CTkRadioButton(
+                    row_frame,
+                    text=f"{fmt['name']}   ({fmt.get('extension', '')})",
+                    variable=self._fmt_radio_var,
+                    value=fmt["id"],
+                    command=lambda fid=fmt["id"]: self._set_active_format(fid),
+                ).pack(side="left", padx=(4, 0))
+
+                ctk.CTkButton(
+                    row_frame, text="Bearbeiten",
+                    width=90, height=28,
+                    command=lambda f=fmt: self._edit_format(f),
+                ).pack(side="right", padx=(4, 0))
+
+                if not fmt.get("builtin", False):
+                    ctk.CTkButton(
+                        row_frame, text="🗑",
+                        width=34, height=28,
+                        fg_color=("gray72", "gray28"),
+                        hover_color=("#c0392b", "#922b21"),
+                        text_color=("gray10", "gray90"),
+                        command=lambda f=fmt: self._delete_format(f),
+                    ).pack(side="right", padx=(0, 2))
+
+            ctk.CTkButton(
+                frame,
+                text="➕  Format hinzufügen",
+                command=self._new_format,
+                width=180, height=30,
+                fg_color="transparent", border_width=1,
+                text_color=("gray10", "gray90"),
+            ).grid(row=len(fmts) + 1, column=0, sticky="w",
+                   padx=8, pady=(10, 8))
+
+        def _reload_formats_tab(self):
+            if hasattr(self, "_fmt_tab_frame"):
+                self._build_formats_tab(self._fmt_tab_frame)
+
+        def _set_active_format(self, fmt_id: str):
+            s = load_settings()
+            s["active_format"] = fmt_id
+            save_settings(s)
+
+        def _new_format(self):
+            dlg = FormatEditorDialog(self, {})
+            if dlg.result:
+                s    = load_settings()
+                fmts = s.get("formats", [])
+                fmts.append(dlg.result)
+                s["formats"] = fmts
+                save_settings(s)
+                self._reload_formats_tab()
+
+        def _edit_format(self, fmt: dict):
+            dlg = FormatEditorDialog(self, dict(fmt))
+            if dlg.result:
+                s = load_settings()
+                s["formats"] = [
+                    dlg.result if f["id"] == fmt["id"] else f
+                    for f in s.get("formats", [])
+                ]
+                save_settings(s)
+                self._reload_formats_tab()
+
+        def _delete_format(self, fmt: dict):
+            if messagebox.askyesno(
+                "Format löschen",
+                f"Format '{fmt['name']}' wirklich löschen?",
+                parent=self,
+            ):
+                s         = load_settings()
+                s["formats"] = [f for f in s.get("formats", [])
+                                 if f["id"] != fmt["id"]]
+                if s.get("active_format") == fmt["id"]:
+                    s["active_format"] = "builtin_md"
+                save_settings(s)
+                self._reload_formats_tab()
+
+    # ── Statistik-Dialog ──────────────────────────────────────────────────────
+
+    class StatsDialog(ctk.CTkToplevel):
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.title("Statistik – Zeitersparnis")
+            self.geometry("820x500")
+            self.minsize(640, 380)
+            self.transient(parent)
+            self.grab_set()
+            self.lift()
+            self.focus_force()
+            self._build_ui()
+            self._load()
+            self.wait_window()
+
+        def _build_ui(self):
+            self.columnconfigure(0, weight=1)
+            self.rowconfigure(2, weight=1)
+
+            ctk.CTkLabel(
+                self, text="📊  Zeitersparnis-Statistik",
+                font=ctk.CTkFont(size=18, weight="bold"), anchor="w",
+            ).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 8))
+
+            banner = ctk.CTkFrame(self, corner_radius=8,
+                                   fg_color=("#d4f5e2", "#0d2b1a"))
+            banner.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+            self._total_var = tk.StringVar()
+            ctk.CTkLabel(
+                banner, textvariable=self._total_var,
+                font=ctk.CTkFont(size=13, weight="bold"),
+                text_color=("#1a7a42", "#2ecc86"), anchor="w",
+            ).pack(padx=14, pady=10, fill="x")
+
+            self._log_box = ctk.CTkTextbox(
+                self,
+                font=ctk.CTkFont(family="Consolas", size=10),
+                fg_color=("gray96", "#141420"),
+                text_color=("gray10", "#d4d4d4"),
+                corner_radius=6,
+                state="disabled",
+            )
+            self._log_box.grid(row=2, column=0, sticky="nsew",
+                                padx=16, pady=(0, 10))
+
+            btn_row = ctk.CTkFrame(self, fg_color="transparent")
+            btn_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+            ctk.CTkButton(
+                btn_row, text="🗑  Statistik zurücksetzen",
+                command=self._reset,
+                fg_color=("gray72", "gray28"),
+                hover_color=("#c0392b", "#922b21"),
+                text_color=("gray10", "gray90"),
+                text_color_disabled=("gray35", "gray65"),
+                width=200, height=32,
+            ).pack(side="left")
+            ctk.CTkButton(
+                btn_row, text="Schließen", command=self.destroy,
+                width=110, height=32,
+                fg_color="transparent", border_width=1,
+                text_color=("gray10", "gray90"),
+            ).pack(side="right")
+
+        def _load(self):
+            runs = load_settings().get("runs", [])
+            total_saved = sum(r.get("saved_min", 0) for r in runs)
+            total_human = sum(r.get("human_min", 0) for r in runs)
+            n = len(runs)
+            if n:
+                self._total_var.set(
+                    f"⚡  Gesamt gespart: {_fmt_min(total_saved)}"
+                    f"   ·   Manuell wäre es ~{_fmt_min(total_human)} gewesen"
+                    f"   ·   {n} {'Lauf' if n == 1 else 'Läufe'}"
+                )
+            else:
+                self._total_var.set("Noch keine Läufe gespeichert.")
+
+            header = (
+                f"{'Datum':<18}{'Modus':<10}{'Seiten':>7}  "
+                f"{'Manuell':<14}{'Tool':<12}Gespart\n"
+                + "─" * 78 + "\n"
+            )
+            lines = [header]
+            for run in reversed(runs):
+                mode_lbl = "Sitemap" if run.get("mode") == "sitemap" else "Einzeln"
+                line = (
+                    f"{run.get('date', ''):<18}{mode_lbl:<10}"
+                    f"{run.get('pages', 1):>7}  "
+                    f"~{_fmt_min(run.get('human_min', 0)):<13}"
+                    f"{_fmt_min(run.get('tool_min', 0)):<12}"
+                    f"{_fmt_min(run.get('saved_min', 0))}  "
+                    f"({run.get('pct', 0)} %)\n"
+                )
+                lines.append(line)
+
+            self._log_box.configure(state="normal")
+            self._log_box.delete("1.0", tk.END)
+            self._log_box.insert("1.0", "".join(lines))
+            self._log_box.configure(state="disabled")
+
+        def _reset(self):
+            if messagebox.askyesno(
+                "Statistik zurücksetzen",
+                "Alle gespeicherten Läufe löschen?",
+                parent=self,
+            ):
+                s = load_settings()
+                s["runs"] = []
+                save_settings(s)
+                self._load()
+
+    # ── Haupt-App ─────────────────────────────────────────────────────────────
+
+    class App(ctk.CTk):
+        def __init__(self):
+            super().__init__()
+            self.title(f"Website Scraper → Markdown  v{APP_VERSION}")
+            self.geometry("920x720")
+            self.minsize(660, 560)
+            self._stop_event = threading.Event()
+            self._running = False
+            self._build_ui()
+            self._load_session()
+            # Update-Check nach 3 Sek. (nach vollständigem Fensteraufbau)
+            self.after(3000, self._check_update)
+
+        def _build_ui(self):
+            self.columnconfigure(0, weight=1)
+            self.rowconfigure(1, weight=1)
+
+            # ── Header ────────────────────────────────────────────────────────
+            hdr = ctk.CTkFrame(self, corner_radius=0, fg_color=("gray88", "gray14"))
+            hdr.grid(row=0, column=0, sticky="ew")
+            hdr.columnconfigure(0, weight=1)
+
+            ctk.CTkLabel(
+                hdr, text="🌐  Website Scraper → Markdown",
+                font=ctk.CTkFont(size=20, weight="bold"), anchor="w",
+            ).grid(row=0, column=0, sticky="w", padx=22, pady=(14, 2))
+            ctk.CTkLabel(
+                hdr,
+                text="Extrahiert Webseiten vollständig als strukturierte Markdown-Dateien",
+                font=ctk.CTkFont(size=12), text_color="gray55", anchor="w",
+            ).grid(row=1, column=0, sticky="w", padx=22, pady=(0, 14))
+            ctk.CTkButton(
+                hdr, text="⚙  Einstellungen", command=self._open_settings,
+                width=148, height=34,
+            ).grid(row=0, column=1, rowspan=2, padx=(0, 8))
+            ctk.CTkButton(
+                hdr, text="📊  Statistik", command=self._open_stats,
+                width=130, height=34,
+            ).grid(row=0, column=2, rowspan=2, padx=(0, 20))
+
+            # ── Content ───────────────────────────────────────────────────────
+            cnt = ctk.CTkFrame(self, fg_color="transparent")
+            cnt.grid(row=1, column=0, sticky="nsew", padx=18, pady=14)
+            cnt.columnconfigure(1, weight=1)
+
+            r = 0
+
+            # Modus-Zeile
+            mode_row = ctk.CTkFrame(cnt, fg_color="transparent")
+            mode_row.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+            mode_row.columnconfigure(2, weight=1)
+            ctk.CTkLabel(mode_row, text="Modus",
+                         font=ctk.CTkFont(weight="bold")).pack(side="left", padx=(0, 14))
+            self._mode_var = tk.StringVar(value="single")
+            ctk.CTkRadioButton(mode_row, text="Einzelne Seite",
+                               variable=self._mode_var, value="single",
+                               command=self._mode_changed).pack(side="left", padx=(0, 20))
+            ctk.CTkRadioButton(mode_row, text="Sitemap  (alle Seiten)",
+                               variable=self._mode_var, value="sitemap",
+                               command=self._mode_changed).pack(side="left")
+            self._sim_var = tk.BooleanVar(value=False)
+            ctk.CTkCheckBox(mode_row, text="🧪  Simulationsmodus",
+                            variable=self._sim_var,
+                            command=self._sim_changed).pack(side="right")
+            r += 1
+
+            # Simulation-Banner
+            self._sim_banner = ctk.CTkLabel(
+                cnt,
+                text="⚠   SIMULATIONSMODUS AKTIV  –  kein Browser · keine AI-Calls · kein Datenverbrauch",
+                fg_color=("#fff3cd", "#3a2c00"),
+                text_color=("#7a5c00", "#fbbf24"),
+                corner_radius=6,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                anchor="w",
+            )
+            self._sim_banner.grid(row=r, column=0, columnspan=3,
+                                  sticky="ew", pady=(0, 8))
+            self._sim_banner.grid_remove()
+            r += 1
+
+            # URL
+            ctk.CTkLabel(cnt, text="URL", font=ctk.CTkFont(weight="bold"),
+                         anchor="w").grid(row=r, column=0, sticky="w", pady=6)
+            self._url_var = tk.StringVar()
+            ctk.CTkEntry(
+                cnt, textvariable=self._url_var, height=36,
+                placeholder_text="https://example.com/page  oder  https://example.com/sitemap.xml",
+            ).grid(row=r, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=6)
+            r += 1
+
+            # Ausgabe
+            self._out_label = ctk.CTkLabel(cnt, text="Ausgabedatei",
+                                            font=ctk.CTkFont(weight="bold"), anchor="w")
+            self._out_label.grid(row=r, column=0, sticky="w", pady=6)
+            self._out_var = tk.StringVar()
+            ctk.CTkEntry(cnt, textvariable=self._out_var, height=36,
+                         placeholder_text="Ausgabepfad (leer = automatisch)").grid(
+                row=r, column=1, sticky="ew", padx=(10, 6), pady=6)
+            ctk.CTkButton(cnt, text="…", width=36, height=36,
+                          command=self._browse_output).grid(row=r, column=2, sticky="w")
+            r += 1
+
+            # Buttons
+            btn_row = ctk.CTkFrame(cnt, fg_color="transparent")
+            btn_row.grid(row=r, column=0, columnspan=3, sticky="w", pady=(2, 10))
+
+            self._start_btn = ctk.CTkButton(
+                btn_row, text="▶  Extrahieren", command=self._start,
+                width=154, height=38, font=ctk.CTkFont(size=13, weight="bold"),
+            )
+            self._start_btn.pack(side="left", padx=(0, 8))
+
+            self._stop_btn = ctk.CTkButton(
+                btn_row, text="⏹  Abbrechen", command=self._cancel,
+                state="disabled", width=134, height=38,
+                fg_color=("gray72", "gray28"), hover_color=("gray62", "gray38"),
+                text_color=("gray10", "gray90"),
+                text_color_disabled=("gray35", "gray65"),
+            )
+            self._stop_btn.pack(side="left", padx=(0, 8))
+
+            self._open_btn = ctk.CTkButton(
+                btn_row, text="📄  Öffnen", command=self._open_file,
+                width=110, height=38,
+                fg_color="transparent", border_width=1,
+                text_color=("gray10", "gray90"),
+            )
+            self._open_btn.pack(side="left")
+            r += 1
+
+            # Fortschritts-Karte
+            prog_card = ctk.CTkFrame(cnt, corner_radius=10)
+            prog_card.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+            prog_card.columnconfigure(0, weight=1)
+
+            self._prog_bar = ctk.CTkProgressBar(prog_card, height=14, corner_radius=6)
+            self._prog_bar.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 4))
+            self._prog_bar.set(0)
+
+            self._status_var = tk.StringVar(value="Bereit.")
+            ctk.CTkLabel(
+                prog_card, textvariable=self._status_var,
+                font=ctk.CTkFont(size=11), text_color="gray55", anchor="w",
+            ).grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
+
+            # Sitemap-Unterbereich (versteckt bis Sitemap-Modus aktiv)
+            self._sep = ctk.CTkFrame(prog_card, height=1, fg_color="gray35")
+            self._sep.grid(row=2, column=0, sticky="ew", padx=14)
+            self._sep.grid_remove()
+
+            self._sitemap_sub = ctk.CTkFrame(prog_card, fg_color="transparent")
+            self._sitemap_sub.grid(row=3, column=0, sticky="ew", padx=14, pady=(6, 12))
+            self._sitemap_sub.grid_remove()
+            self._sitemap_sub.columnconfigure(0, weight=1)
+
+            sm_info = ctk.CTkFrame(self._sitemap_sub, fg_color="transparent")
+            sm_info.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+            self._pages_var = tk.StringVar(value="")
+            ctk.CTkLabel(sm_info, textvariable=self._pages_var,
+                         font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
+            self._avg_var = tk.StringVar(value="")
+            ctk.CTkLabel(sm_info, textvariable=self._avg_var,
+                         font=ctk.CTkFont(size=11), text_color="gray55").pack(
+                side="left", padx=(18, 0))
+
+            self._sitemap_bar = ctk.CTkProgressBar(
+                self._sitemap_sub, height=10, corner_radius=4,
+                progress_color=("#1a9e5c", "#2ecc86"),
+            )
+            self._sitemap_bar.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+            self._sitemap_bar.set(0)
+
+            self._eta_var = tk.StringVar(value="")
+            ctk.CTkLabel(self._sitemap_sub, textvariable=self._eta_var,
+                         font=ctk.CTkFont(size=11), text_color="gray55",
+                         anchor="w").grid(row=2, column=0, sticky="ew")
+            r += 1
+
+            # Savings-Banner (anfangs versteckt, erscheint nach Abschluss)
+            self._savings_frame = ctk.CTkFrame(cnt, corner_radius=8,
+                                                fg_color=("#d4f5e2", "#0d2b1a"))
+            self._savings_frame.grid(row=r, column=0, columnspan=3,
+                                      sticky="ew", pady=(0, 8))
+            self._savings_frame.grid_remove()
+            self._savings_var = tk.StringVar(value="")
+            ctk.CTkLabel(
+                self._savings_frame, textvariable=self._savings_var,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=("#1a7a42", "#2ecc86"), anchor="w",
+            ).pack(padx=14, pady=8, fill="x")
+            r += 1
+
+            # Log-Karte
+            log_card = ctk.CTkFrame(cnt, corner_radius=10)
+            log_card.grid(row=r, column=0, columnspan=3, sticky="nsew")
+            log_card.columnconfigure(0, weight=1)
+            log_card.rowconfigure(1, weight=1)
+            cnt.rowconfigure(r, weight=1)
+
+            ctk.CTkLabel(
+                log_card, text="Protokoll",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color="gray50", anchor="w",
+            ).grid(row=0, column=0, sticky="w", padx=12, pady=(8, 0))
+
+            self._log_box = ctk.CTkTextbox(
+                log_card,
+                font=ctk.CTkFont(family="Consolas", size=10),
+                fg_color=("gray96", "#141420"),
+                text_color=("gray10", "#d4d4d4"),
+                corner_radius=6,
+            )
+            self._log_box.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 8))
+
+        # ── Simulationsmodus ──────────────────────────────────────────────────
+
+        def _sim_changed(self):
+            if self._sim_var.get():
+                self._sim_banner.grid()
+            else:
+                self._sim_banner.grid_remove()
+
+        # ── Modus-Wechsel ─────────────────────────────────────────────────────
+
+        def _mode_changed(self):
+            mode = self._mode_var.get()
+            if mode == "sitemap":
+                self._out_label.configure(text="Ausgabeordner")
+                self._open_btn.configure(text="📁  Öffnen")
+                self._sep.grid()
+                self._sitemap_sub.grid()
+            else:
+                self._out_label.configure(text="Ausgabedatei")
+                self._open_btn.configure(text="📄  Öffnen")
+                self._sep.grid_remove()
+                self._sitemap_sub.grid_remove()
+            self._out_var.set("")
+
+        # ── UI-Helfer ─────────────────────────────────────────────────────────
+
+        def _browse_output(self):
+            if self._mode_var.get() == "sitemap":
+                f = filedialog.askdirectory(title="Ausgabeordner wählen")
+            else:
+                fmt  = get_active_format()
+                ext  = fmt.get("extension", ".md")
+                name = fmt.get("name", "Markdown")
+                f = filedialog.asksaveasfilename(
+                    defaultextension=ext,
+                    filetypes=[(name, f"*{ext}"), ("Alle Dateien", "*.*")],
+                    title="Ausgabedatei wählen",
+                )
+            if f:
+                self._out_var.set(f)
+
+        def _open_file(self):
+            p = self._out_var.get()
+            if not p:
+                messagebox.showinfo("Hinweis", "Kein Ausgabepfad angegeben.")
+                return
+            path = Path(p)
+            if path.exists():
+                self._open_or_reveal(str(path))
+            else:
+                messagebox.showinfo("Hinweis", "Datei/Ordner nicht gefunden.")
+
+        @staticmethod
+        def _open_or_reveal(p: str):
+            path = str(Path(p))
+            try:
+                os.startfile(path)
+            except OSError:
+                subprocess.Popen(["explorer", "/select,", path])
+
+        def _open_settings(self):
+            SettingsDialog(self)
+
+        def _open_stats(self):
+            StatsDialog(self)
+
+        # ── Update-Check ──────────────────────────────────────────────────────
+
+        def _check_update(self):
+            """Startet den Update-Check im Hintergrund (kein UI-Block)."""
+            token = get_api_key("github")
+            if not token:
+                return
+            threading.Thread(target=self._check_update_bg,
+                             args=(token,), daemon=True).start()
+
+        def _check_update_bg(self, token: str):
+            try:
+                result = _check_for_update(token)
+                if result:
+                    self.after(0, self._offer_update, *result)
+            except Exception:
+                pass  # Kein Netz, kein Token, kein Release → still ignorieren
+
+        def _offer_update(self, new_ver: str, asset_url: str):
+            if self._running:
+                return  # Kein Update während einer laufenden Extraktion
+            if messagebox.askyesno(
+                "Update verfügbar",
+                f"Version {new_ver} ist verfügbar  (aktuell: {APP_VERSION})\n\n"
+                "Die App wird aktualisiert, kurz neu gestartet und ist dann\n"
+                "sofort einsatzbereit. Jetzt aktualisieren?",
+            ):
+                self._run_update(new_ver, asset_url)
+
+        def _run_update(self, new_ver: str, asset_url: str):
+            token = get_api_key("github")
+            try:
+                self._status_var.set(f"Lade Version {new_ver} herunter…")
+                self.update_idletasks()
+                data    = _download_update(token, asset_url)
+                script  = Path(__file__).resolve()
+                tmp     = script.with_name("website_scraper.new.py")
+                updater = script.with_name("_ws_updater.py")
+                tmp.write_bytes(data)
+                # repr(str(...)) macht Pfade mit Leerzeichen + Sonderzeichen sicher
+                updater.write_text(
+                    "import time, sys, subprocess\n"
+                    "from pathlib import Path\n"
+                    "time.sleep(2)\n"
+                    f"Path({repr(str(tmp))}).replace(Path({repr(str(script))}))\n"
+                    f"subprocess.Popen([sys.executable, {repr(str(script))}])\n"
+                    f"Path({repr(str(updater))}).unlink(missing_ok=True)\n",
+                    encoding="utf-8",
+                )
+                # pythonw.exe → kein Konsolenfenster; DETACHED → unabhängig vom Parent
+                pythonw = Path(sys.executable).with_name("pythonw.exe")
+                interp  = str(pythonw) if pythonw.exists() else sys.executable
+                flags   = (getattr(subprocess, "DETACHED_PROCESS", 0) |
+                           getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                subprocess.Popen([interp, str(updater)], creationflags=flags)
+                self.destroy()
+            except Exception as exc:
+                messagebox.showerror("Update fehlgeschlagen", str(exc))
+
+        def _show_savings(self, human_min: float, tool_secs: float):
+            tool_min = tool_secs / 60
+            saved_min = max(0.0, human_min - tool_min)
+            pct = int(saved_min / max(human_min, 0.01) * 100)
+            self._savings_var.set(
+                f"⚡  Ein Mensch hätte ~{_fmt_min(human_min)} benötigt  ·  "
+                f"Tool-Laufzeit: {_fmt_min(tool_min)}  ·  "
+                f"Zeitersparnis: {pct} %"
+            )
+            self._savings_frame.grid()
+
+        def _load_session(self):
+            s = load_settings()
+            self._url_var.set(s.get("last_url", ""))
+            mode = s.get("last_mode", "single")
+            self._mode_var.set(mode)
+            self._mode_changed()
+            self._out_var.set(s.get(f"last_output_{mode}", ""))
+            # Simulationsmodus immer deaktiviert starten (nie persistieren)
+            self._sim_var.set(False)
+            self._sim_banner.grid_remove()
+
+        def _save_session(self):
+            s = load_settings()
+            s["last_url"] = self._url_var.get()
+            s["last_mode"] = self._mode_var.get()
+            s[f"last_output_{self._mode_var.get()}"] = self._out_var.get()
+            save_settings(s)
+
+        # ── Logging / Fortschritt (thread-sicher) ─────────────────────────────
+
+        def _log(self, msg: str):
+            self.after(0, self._log_ui, msg)
+
+        def _log_ui(self, msg: str):
+            self._log_box.insert(tk.END, msg + "\n")
+            self._log_box.see(tk.END)
+            self._status_var.set(msg[:120])
+
+        def _set_progress(self, v: float):
+            def _do():
+                self._prog_bar.set(v / 100.0)
+                self._prog_bar.update_idletasks()
+            self.after(0, _do)
+
+        # ── Sitemap-Fortschritt (thread-sicher) ───────────────────────────────
+
+        def _update_sitemap_progress(self, done: int, total: int, page_times: list):
+            pct = done / max(total, 1)
+            self._sitemap_bar.set(pct)
+            self._pages_var.set(f"Seite {done} von {total}   ({pct * 100:.0f} %)")
+            if page_times:
+                avg = sum(page_times) / len(page_times)
+                remaining_secs = (total - done) * avg
+                h, rem = divmod(int(remaining_secs), 3600)
+                m, s = divmod(rem, 60)
+                if h:
+                    eta_txt = f"Noch ca. {h} Std {m:02d} min {s:02d} sek"
+                elif m:
+                    eta_txt = f"Noch ca. {m} min {s:02d} sek"
+                else:
+                    eta_txt = f"Noch ca. {s} sek"
+                self._eta_var.set(eta_txt)
+                self._avg_var.set(f"  ·  Ø {avg:.0f} Sek / Seite")
+            else:
+                self._eta_var.set("Berechne geschätzte Restzeit…")
+                self._avg_var.set("")
+
+        # ── Extraktion starten / abbrechen ────────────────────────────────────
+
+        def _start(self):
+            url = self._url_var.get().strip()
+            if not url:
+                messagebox.showwarning("Hinweis", "Bitte URL eingeben.")
+                return
+            if not url.startswith("http"):
+                url = "https://" + url
+                self._url_var.set(url)
+
+            output = self._out_var.get().strip()
+            mode = self._mode_var.get()
+            settings = load_settings()
+            settings["simulate"] = self._sim_var.get()
+            provider = settings.get("provider", "openai")
+            describe = settings.get("describe_images", True)
+            active_fmt = get_active_format()
+
+            if describe and not settings["simulate"] and not get_api_key(provider):
+                if not messagebox.askyesno(
+                    "Kein API-Key",
+                    f"Für Provider '{provider}' wurde kein API-Key konfiguriert.\n"
+                    "Bilder werden ohne AI-Beschreibung dokumentiert.\n\n"
+                    "Trotzdem fortfahren?",
+                ):
+                    return
+
+            if mode == "sitemap":
+                if not output:
+                    parsed = urlparse(url)
+                    stem = re.sub(r"[^\w\-]", "_", parsed.netloc)
+                    output = str(Path.home() / "Documents" / stem)
+                    self._out_var.set(output)
+                Path(output).mkdir(parents=True, exist_ok=True)
+            else:
+                if not output:
+                    parsed = urlparse(url)
+                    stem = re.sub(r"[^\w\-.]", "_", parsed.netloc + parsed.path).strip("_")
+                    ext = active_fmt.get("extension", ".md")
+                    output = str(Path.home() / "Documents" / f"{stem[:80]}{ext}")
+                    self._out_var.set(output)
+
+            self._save_session()
+            self._run_start = time.time()
+            self._last_url  = url
+            self._last_fmt  = active_fmt
+            self._savings_frame.grid_remove()
+            self._savings_var.set("")
+            self._stop_event.clear()
+            self._running = True
+            self._start_btn.configure(state="disabled")
+            self._stop_btn.configure(state="normal")
+            self._prog_bar.set(0)
+            self._log_box.delete("1.0", tk.END)
+
+            if mode == "sitemap":
+                self._pages_var.set("Lade Sitemap…")
+                self._eta_var.set("")
+                self._avg_var.set("")
+                self._sitemap_bar.set(0)
+                threading.Thread(target=self._worker_sitemap,
+                                 args=(url, output, settings), daemon=True).start()
+            else:
+                threading.Thread(target=self._worker,
+                                 args=(url, output, settings), daemon=True).start()
+
+        def _cancel(self):
+            if self._running:
+                self._stop_event.set()
+                self._log_ui("Abbruch angefordert…")
+
+        # ── Worker: Einzelseite ───────────────────────────────────────────────
+
+        def _worker(self, url: str, output: str, settings: dict):
+            try:
+                fmt = get_active_format()
+                scraper = Scraper(settings=settings, log_fn=self._log,
+                                  progress_fn=self._set_progress,
+                                  stop_event=self._stop_event)
+                scraper.run(url, output, output_format=fmt)
+                if not self._stop_event.is_set():
+                    self.after(0, self._done, output)
+                else:
+                    self.after(0, self._cancelled)
+            except Exception as exc:
+                import traceback
+                self._log(f"FEHLER: {exc}\n{traceback.format_exc()}")
+                self.after(0, self._on_error, str(exc))
+
+        # ── Worker: Sitemap ───────────────────────────────────────────────────
+
+        def _worker_sitemap(self, sitemap_url: str, output_dir: str, settings: dict):
+            try:
+                self._log(f"Verarbeite Sitemap: {sitemap_url}")
+                urls = _fetch_sitemap_urls(sitemap_url, self._log)
+                if self._stop_event.is_set():
+                    self.after(0, self._cancelled)
+                    return
+                total = len(urls)
+                if total == 0:
+                    self.after(0, self._on_error,
+                        "Keine URLs in der Sitemap gefunden.\n\n"
+                        "Tipps:\n• URL direkt zur sitemap.xml angeben\n"
+                        "• Manche Seiten haben /sitemap_index.xml")
+                    return
+
+                self._log(f"Sitemap geladen: {total} Seiten gefunden")
+                self.after(0, self._update_sitemap_progress, 0, total, [])
+                page_times: list = []
+                failed_urls: list = []
+                out_path = Path(output_dir)
+                fmt      = get_active_format()
+                fmt_ext  = fmt.get("extension", ".md")
+
+                for i, url in enumerate(urls):
+                    if self._stop_event.is_set():
+                        break
+                    self.after(0, self._update_sitemap_progress, i, total, page_times)
+                    self._log(f"\n[{i + 1}/{total}] {url}")
+                    self._set_progress(0)
+                    file_path = str(out_path / _url_to_filename(url, fmt_ext))
+                    t0 = time.time()
+                    try:
+                        scraper = Scraper(settings=settings, log_fn=self._log,
+                                          progress_fn=self._set_progress,
+                                          stop_event=self._stop_event)
+                        scraper.run(url, file_path, output_format=fmt)
+                        page_times.append(time.time() - t0)
+                    except Exception as exc:
+                        self._log(f"  FEHLER: {exc}")
+                        failed_urls.append(url)
+
+                self.after(0, self._update_sitemap_progress,
+                           min(i + 1, total), total, page_times)
+                if not self._stop_event.is_set():
+                    failed_set_local = set(failed_urls)
+                    md_paths = [
+                        str(out_path / _url_to_filename(u, fmt_ext))
+                        for u in urls if u not in failed_set_local
+                    ]
+                    self._write_index(out_path, sitemap_url, urls, failed_urls,
+                                      page_times, ext=fmt_ext)
+                    self.after(0, self._done_sitemap,
+                               output_dir, total, failed_urls, page_times, md_paths)
+                else:
+                    self.after(0, self._cancelled)
+            except Exception as exc:
+                import traceback
+                self._log(f"FEHLER: {exc}\n{traceback.format_exc()}")
+                self.after(0, self._on_error, str(exc))
+
+        def _write_index(self, out_path: Path, sitemap_url: str,
+                         urls: list, failed: list, page_times: list,
+                         ext: str = ".md"):
+            avg = sum(page_times) / len(page_times) if page_times else 0
+            total_min = sum(page_times) / 60 if page_times else 0
+            ok = len(urls) - len(failed)
+            failed_set = set(failed)
+            lines = [
+                "# Sitemap-Extraktion", "",
+                f"**Quelle:** {sitemap_url}  ",
+                f"**Datum:** {time.strftime('%d.%m.%Y %H:%M')}  ",
+                f"**Ergebnis:** {ok} von {len(urls)} Seiten erfolgreich  ",
+                f"**Dauer:** {total_min:.1f} min  ·  Ø {avg:.0f} Sek/Seite",
+                "", "## Seiten", "",
+            ]
+            for url in urls:
+                fn = _url_to_filename(url, ext)
+                if url in failed_set:
+                    lines.append(f"- ~~[{url}]({fn})~~ *(fehlgeschlagen)*")
+                else:
+                    lines.append(f"- [{url}]({fn})")
+            # Zeitersparnis-Tabelle
+            try:
+                md_paths = [str(out_path / _url_to_filename(u, ext))
+                            for u in urls if u not in failed_set]
+                human_min, total_words, total_images = _estimate_human_time(md_paths)
+                saved_min = max(0.0, human_min - total_min)
+                pct = int(saved_min / max(human_min, 0.01) * 100)
+                lines += [
+                    "", "---", "", "## ⚡ Zeitersparnis", "",
+                    "| | Zeit |",
+                    "|---|---|",
+                    f"| 👤 Menschliche Bearbeitungszeit (geschätzt) | ~{_fmt_min(human_min)} |",
+                    f"| 🤖 Tool-Laufzeit | {_fmt_min(total_min)} |",
+                    f"| ⚡ Gespart | ~{_fmt_min(saved_min)} **(−{pct} %)** |",
+                    "",
+                    f"_Basis: {total_words:,} Inhaltswörter · {total_images} Bilder · "
+                    f"3 Min Basis + 1 Min/100 Wörter + 2,5 Min/Bild_",
+                ]
+            except Exception:
+                pass
+            try:
+                idx = out_path / "_index.md"
+                idx.write_text("\n".join(lines), encoding="utf-8")
+                self._log(f"\nIndex erstellt: {idx}")
+            except Exception as exc:
+                self._log(f"Index-Fehler: {exc}")
+
+        # ── Fertig-Handler ────────────────────────────────────────────────────
+
+        def _done(self, output: str):
+            self._running = False
+            self._start_btn.configure(state="normal")
+            self._stop_btn.configure(state="disabled")
+            self._prog_bar.set(1.0)
+            human_min, nwords, nimages = _estimate_human_time([output])
+            self._log(f"[Zeitschätzung] {nwords} Inhaltswörter · {nimages} Bilder → {human_min:.1f} Min")
+            tool_secs = time.time() - getattr(self, "_run_start", time.time())
+            tool_min = tool_secs / 60
+            saved_min = max(0.0, human_min - tool_min)
+            pct = int(saved_min / max(human_min, 0.01) * 100)
+            self._show_savings(human_min, tool_secs)
+            _save_run(getattr(self, "_last_url", ""), "single", 1,
+                      tool_min, human_min)
+            fmt_name = getattr(self, "_last_fmt", {}).get("name", "Markdown")
+            if messagebox.askyesno(
+                "Fertig!",
+                f"{fmt_name}-Datei gespeichert:\n{output}\n\n"
+                f"⚡  Zeitersparnis: ~{_fmt_min(saved_min)} ({pct} %)\n"
+                f"   Manuell: ~{_fmt_min(human_min)}  ·  Tool: {_fmt_min(tool_min)}\n\n"
+                f"Jetzt öffnen?",
+            ):
+                self._open_or_reveal(output)
+
+        def _done_sitemap(self, output_dir: str, total: int,
+                          failed_urls: list, page_times: list, md_paths: list):
+            self._running = False
+            self._start_btn.configure(state="normal")
+            self._stop_btn.configure(state="disabled")
+            self._prog_bar.set(1.0)
+            self._sitemap_bar.set(1.0)
+            failed = len(failed_urls)
+            ok = total - failed
+            avg = sum(page_times) / len(page_times) if page_times else 0
+            tool_min_total = sum(page_times) / 60 if page_times else 0
+            human_min, _, _ = _estimate_human_time(md_paths)
+            tool_secs = sum(page_times)
+            saved_min = max(0.0, human_min - tool_min_total)
+            pct = int(saved_min / max(human_min, 0.01) * 100)
+            self._pages_var.set(f"Seite {total} von {total}   (100 %)")
+            self._eta_var.set(f"Fertig!  {ok} von {total} Seiten erfolgreich.")
+            self._avg_var.set(f"  ·  Ø {avg:.0f} Sek / Seite")
+            self._show_savings(human_min, tool_secs)
+            _save_run(getattr(self, "_last_url", ""), "sitemap", ok,
+                      tool_min_total, human_min)
+            summary = (
+                f"Sitemap-Extraktion abgeschlossen!\n\n"
+                f"✅  {ok} Seiten erfolgreich\n"
+                + (f"❌  {failed} Fehler\n" if failed else "")
+                + f"\n⏱  Gesamt: {tool_min_total:.1f} min  ·  Ø {avg:.0f} Sek/Seite\n"
+                f"\n⚡  Zeitersparnis: ~{_fmt_min(saved_min)} ({pct} %)\n"
+                f"   Manuell: ~{_fmt_min(human_min)}  ·  Tool: {_fmt_min(tool_min_total)}\n"
+                f"\n📁  {output_dir}"
+            )
+            if messagebox.askyesno("Fertig!", summary + "\n\nOrdner öffnen?"):
+                self._open_or_reveal(output_dir)
+
+        def _cancelled(self):
+            self._running = False
+            self._start_btn.configure(state="normal")
+            self._stop_btn.configure(state="disabled")
+            self._status_var.set("Abgebrochen.")
+
+        def _on_error(self, msg: str):
+            self._running = False
+            self._start_btn.configure(state="normal")
+            self._stop_btn.configure(state="disabled")
+            messagebox.showerror("Fehler", f"Extraktion fehlgeschlagen:\n\n{msg}")
+
+    App().mainloop()
