@@ -2080,9 +2080,9 @@ if __name__ == "__main__":
                 font=ctk.CTkFont(size=12, weight="bold"),
                 anchor="w",
             )
-            self._sim_banner.grid(row=r, column=0, columnspan=3,
-                                  sticky="ew", pady=(0, 8))
-            self._sim_banner.grid_remove()
+            # Nicht initial ins Grid – erst bei Aktivierung einsetzen,
+            # da grid()+grid_remove() auf manchen Systemen kurz sichtbar bleibt
+            self._sim_banner_row = r
             r += 1
 
             # URL
@@ -2223,7 +2223,10 @@ if __name__ == "__main__":
 
         def _sim_changed(self):
             if self._sim_var.get():
-                self._sim_banner.grid()
+                self._sim_banner.grid(
+                    row=self._sim_banner_row, column=0, columnspan=3,
+                    sticky="ew", pady=(0, 8),
+                )
             else:
                 self._sim_banner.grid_remove()
 
@@ -2363,7 +2366,6 @@ if __name__ == "__main__":
             self._out_var.set(s.get(f"last_output_{mode}", ""))
             # Simulationsmodus immer deaktiviert starten (nie persistieren)
             self._sim_var.set(False)
-            self._sim_banner.grid_remove()
 
         def _save_session(self):
             s = load_settings()
