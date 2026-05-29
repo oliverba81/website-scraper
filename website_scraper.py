@@ -1293,6 +1293,67 @@ if __name__ == "__main__":
 
     # ── Einstellungs-Dialog ───────────────────────────────────────────────────
 
+    # ── Zentrierter Nachrichten-Dialog ────────────────────────────────────────
+
+    class _MsgBox(ctk.CTkToplevel):
+        """Ersatz für tkinter.messagebox – erscheint immer mittig zum Elternfenster."""
+
+        def __init__(self, parent, title: str, message: str, kind: str = "ok"):
+            super().__init__(parent)
+            self.result = False
+            self.title(title)
+            self.resizable(False, False)
+            self.transient(parent)
+            self.grab_set()
+            self.lift()
+            self.focus_force()
+            self._build(message, kind)
+            self._center(parent)
+            self.wait_window()
+
+        def _build(self, message: str, kind: str):
+            self.columnconfigure(0, weight=1)
+            ctk.CTkLabel(
+                self, text=message, wraplength=380, justify="left",
+                font=ctk.CTkFont(size=13), anchor="w",
+            ).grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 14))
+            btn = ctk.CTkFrame(self, fg_color="transparent")
+            btn.grid(row=1, column=0, padx=16, pady=(0, 16), sticky="e")
+            if kind == "yesno":
+                ctk.CTkButton(
+                    btn, text="Nein", width=92, height=32,
+                    fg_color="transparent", border_width=1,
+                    text_color=("gray10", "gray90"),
+                    command=self.destroy,
+                ).pack(side="left", padx=(0, 8))
+                ctk.CTkButton(
+                    btn, text="Ja", width=92, height=32,
+                    command=self._yes,
+                ).pack(side="left")
+            else:
+                ctk.CTkButton(
+                    btn, text="OK", width=92, height=32,
+                    command=self.destroy,
+                ).pack(side="left")
+
+        def _yes(self):
+            self.result = True
+            self.destroy()
+
+        def _center(self, parent):
+            self.update_idletasks()
+            dw = self.winfo_reqwidth()
+            dh = self.winfo_reqheight()
+            px = parent.winfo_x() + (parent.winfo_width()  - dw) // 2
+            py = parent.winfo_y() + (parent.winfo_height() - dh) // 2
+            self.geometry(f"+{px}+{py}")
+
+    def _askyn(parent, title: str, msg: str) -> bool:
+        return _MsgBox(parent, title, msg, "yesno").result
+
+    def _showmsg(parent, title: str, msg: str):
+        _MsgBox(parent, title, msg, "ok")
+
     # ── FormatEditorDialog ────────────────────────────────────────────────────
 
     class FormatEditorDialog(ctk.CTkToplevel):
@@ -1516,8 +1577,7 @@ if __name__ == "__main__":
         def _save(self):
             name = self._name_var.get().strip()
             if not name:
-                messagebox.showwarning(
-                    "Hinweis", "Bitte einen Namen eingeben.", parent=self)
+                _showmsg(self, "Hinweis", "Bitte einen Namen eingeben.")
                 return
             self.result = self._collect()
             self.destroy()
@@ -1728,7 +1788,7 @@ if __name__ == "__main__":
                 set_api_key("gemini", gem)
             # Modus sofort anwenden (kein Neustart nötig)
             ctk.set_appearance_mode(appearance)
-            messagebox.showinfo("Einstellungen", "Gespeichert.", parent=self)
+            _showmsg(self, "Einstellungen", "Gespeichert.")
             self.destroy()
 
         # ── Formate-Tab ───────────────────────────────────────────────────────
@@ -1821,11 +1881,8 @@ if __name__ == "__main__":
                 self._reload_formats_tab()
 
         def _delete_format(self, fmt: dict):
-            if messagebox.askyesno(
-                "Format löschen",
-                f"Format '{fmt['name']}' wirklich löschen?",
-                parent=self,
-            ):
+            if _askyn(self, "Format löschen",
+                      f"Format '{fmt['name']}' wirklich löschen?"):
                 s         = load_settings()
                 s["formats"] = [f for f in s.get("formats", [])
                                  if f["id"] != fmt["id"]]
@@ -1936,11 +1993,8 @@ if __name__ == "__main__":
             self._log_box.configure(state="disabled")
 
         def _reset(self):
-            if messagebox.askyesno(
-                "Statistik zurücksetzen",
-                "Alle gespeicherten Läufe löschen?",
-                parent=self,
-            ):
+            if _askyn(self, "Statistik zurücksetzen",
+                      "Alle gespeicherten Läufe löschen?"):
                 s = load_settings()
                 s["runs"] = []
                 save_settings(s)
@@ -2207,13 +2261,13 @@ if __name__ == "__main__":
         def _open_file(self):
             p = self._out_var.get()
             if not p:
-                messagebox.showinfo("Hinweis", "Kein Ausgabepfad angegeben.")
+                _showmsg(self, "Hinweis", "Kein Ausgabepfad angegeben.")
                 return
             path = Path(p)
             if path.exists():
                 self._open_or_reveal(str(path))
             else:
-                messagebox.showinfo("Hinweis", "Datei/Ordner nicht gefunden.")
+                _showmsg(self, "Hinweis", "Datei/Ordner nicht gefunden.")
 
         @staticmethod
         def _open_or_reveal(p: str):
@@ -2251,8 +2305,8 @@ if __name__ == "__main__":
         def _offer_update(self, new_ver: str, asset_url: str):
             if self._running:
                 return  # Kein Update während einer laufenden Extraktion
-            if messagebox.askyesno(
-                "Update verfügbar",
+            if _askyn(
+                self, "Update verfügbar",
                 f"Version {new_ver} ist verfügbar  (aktuell: {APP_VERSION})\n\n"
                 "Die App wird aktualisiert, kurz neu gestartet und ist dann\n"
                 "sofort einsatzbereit. Jetzt aktualisieren?",
@@ -2287,7 +2341,7 @@ if __name__ == "__main__":
                 subprocess.Popen([interp, str(updater)], creationflags=flags)
                 self.destroy()
             except Exception as exc:
-                messagebox.showerror("Update fehlgeschlagen", str(exc))
+                _showmsg(self, "Update fehlgeschlagen", str(exc))
 
         def _show_savings(self, human_min: float, tool_secs: float):
             tool_min = tool_secs / 60
@@ -2362,7 +2416,7 @@ if __name__ == "__main__":
         def _start(self):
             url = self._url_var.get().strip()
             if not url:
-                messagebox.showwarning("Hinweis", "Bitte URL eingeben.")
+                _showmsg(self, "Hinweis", "Bitte URL eingeben.")
                 return
             if not url.startswith("http"):
                 url = "https://" + url
@@ -2377,8 +2431,8 @@ if __name__ == "__main__":
             active_fmt = get_active_format()
 
             if describe and not settings["simulate"] and not get_api_key(provider):
-                if not messagebox.askyesno(
-                    "Kein API-Key",
+                if not _askyn(
+                    self, "Kein API-Key",
                     f"Für Provider '{provider}' wurde kein API-Key konfiguriert.\n"
                     "Bilder werden ohne AI-Beschreibung dokumentiert.\n\n"
                     "Trotzdem fortfahren?",
@@ -2574,8 +2628,8 @@ if __name__ == "__main__":
             _save_run(getattr(self, "_last_url", ""), "single", 1,
                       tool_min, human_min)
             fmt_name = getattr(self, "_last_fmt", {}).get("name", "Markdown")
-            if messagebox.askyesno(
-                "Fertig!",
+            if _askyn(
+                self, "Fertig!",
                 f"{fmt_name}-Datei gespeichert:\n{output}\n\n"
                 f"⚡  Zeitersparnis: ~{_fmt_min(saved_min)} ({pct} %)\n"
                 f"   Manuell: ~{_fmt_min(human_min)}  ·  Tool: {_fmt_min(tool_min)}\n\n"
@@ -2613,7 +2667,7 @@ if __name__ == "__main__":
                 f"   Manuell: ~{_fmt_min(human_min)}  ·  Tool: {_fmt_min(tool_min_total)}\n"
                 f"\n📁  {output_dir}"
             )
-            if messagebox.askyesno("Fertig!", summary + "\n\nOrdner öffnen?"):
+            if _askyn(self, "Fertig!", summary + "\n\nOrdner öffnen?"):
                 self._open_or_reveal(output_dir)
 
         def _cancelled(self):
@@ -2626,6 +2680,6 @@ if __name__ == "__main__":
             self._running = False
             self._start_btn.configure(state="normal")
             self._stop_btn.configure(state="disabled")
-            messagebox.showerror("Fehler", f"Extraktion fehlgeschlagen:\n\n{msg}")
+            _showmsg(self, "Fehler", f"Extraktion fehlgeschlagen:\n\n{msg}")
 
     App().mainloop()
