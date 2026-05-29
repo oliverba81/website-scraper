@@ -2011,6 +2011,10 @@ if __name__ == "__main__":
             super().__init__()
             self.title(f"Website Scraper → Markdown  v{APP_VERSION}")
             self.geometry("920x720")
+            self.update_idletasks()
+            x = (self.winfo_screenwidth()  - 920) // 2
+            y = (self.winfo_screenheight() - 720) // 2
+            self.geometry(f"920x720+{x}+{y}")
             self.minsize(660, 560)
             self._stop_event = threading.Event()
             self._running = False
