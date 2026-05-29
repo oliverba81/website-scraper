@@ -1,2 +1,3 @@
 @echo off
-py website_scraper.py
+cd /d "%~dp0"
+start "" pythonw website_scraper.py
