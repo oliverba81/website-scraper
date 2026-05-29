@@ -29,8 +29,10 @@ APP_NAME    = "website_scraper"
 APP_VERSION = "1.0.0"
 SETTINGS_FILE = Path.home() / f".{APP_NAME}_settings.json"
 
-GITHUB_REPO     = "oliverba81/website-scraper"
-GITHUB_API_BASE = f"https://api.github.com/repos/{GITHUB_REPO}"
+GITHUB_REPO         = "oliverba81/website-scraper"
+GITHUB_API_BASE     = f"https://api.github.com/repos/{GITHUB_REPO}"
+# Read-only PAT (Contents: Read-only) – nur für Release-Checks, kein Schreibzugriff
+GITHUB_UPDATE_TOKEN = "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"
 
 # ── Menschliche Zeitschätzung ────────────────────────────────────────────────
 HUMAN_MIN_BASE          = 3.0   # Basis: Navigation + Datei anlegen + Überblick
@@ -2253,7 +2255,8 @@ if __name__ == "__main__":
 
         def _check_update(self):
             """Startet den Update-Check im Hintergrund (kein UI-Block)."""
-            token = get_api_key("github")
+            # Eingetragener Token hat Vorrang; sonst eingebetteter Fallback-Token
+            token = get_api_key("github") or GITHUB_UPDATE_TOKEN
             if not token:
                 return
             threading.Thread(target=self._check_update_bg,
@@ -2279,7 +2282,7 @@ if __name__ == "__main__":
                 self._run_update(new_ver, asset_url)
 
         def _run_update(self, new_ver: str, asset_url: str):
-            token = get_api_key("github")
+            token = get_api_key("github") or GITHUB_UPDATE_TOKEN
             try:
                 self._status_var.set(f"Lade Version {new_ver} herunter…")
                 self.update_idletasks()
