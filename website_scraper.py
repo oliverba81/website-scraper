@@ -32,6 +32,13 @@ SETTINGS_FILE = Path.home() / f".{APP_NAME}_settings.json"
 GITHUB_REPO     = "oliverba81/website-scraper"
 GITHUB_API_BASE = f"https://api.github.com/repos/{GITHUB_REPO}"
 
+# Read-only Update-Token – in _token.py neben der .py-Datei ablegen (wird nicht ins Git-Repo committed)
+# _token.py Inhalt:  GITHUB_UPDATE_TOKEN = "github_pat_..."
+try:
+    from _token import GITHUB_UPDATE_TOKEN  # type: ignore
+except ImportError:
+    GITHUB_UPDATE_TOKEN = ""
+
 # ── Menschliche Zeitschätzung ────────────────────────────────────────────────
 HUMAN_MIN_BASE          = 3.0   # Basis: Navigation + Datei anlegen + Überblick
 HUMAN_MIN_PER_100_WORDS = 1.0   # Copy-Paste + Markdown-Formatierung (keine KI-Texte)
@@ -1656,30 +1663,7 @@ if __name__ == "__main__":
                          font=ctk.CTkFont(size=11)).pack(side="left")
 
             ctk.CTkFrame(sc, height=1, fg_color="gray35").pack(
-                fill="x", padx=8, pady=(18, 10))
-
-            # ── GitHub Update-Token ───────────────────────────────────────────
-            ctk.CTkLabel(sc, text="GitHub Update-Token",
-                         font=ctk.CTkFont(weight="bold"), anchor="w").pack(
-                anchor="w", padx=8, pady=(0, 2))
-            self._gh_token_var = tk.StringVar()
-            gh_e = ctk.CTkEntry(sc, textvariable=self._gh_token_var,
-                                show="*", width=390)
-            gh_e.pack(anchor="w", padx=8)
-            self._gh_show = tk.BooleanVar()
-            ctk.CTkCheckBox(
-                sc, text="Token anzeigen", variable=self._gh_show,
-                command=lambda: gh_e.configure(
-                    show="" if self._gh_show.get() else "*"),
-            ).pack(anchor="w", padx=8, pady=(4, 0))
-            ctk.CTkLabel(
-                sc,
-                text="Fine-grained PAT: Repository-Permission 'Contents: Read-only' genügt",
-                font=ctk.CTkFont(size=10), text_color="gray55", anchor="w",
-            ).pack(anchor="w", padx=8, pady=(2, 0))
-
-            ctk.CTkFrame(sc, height=1, fg_color="gray35").pack(
-                fill="x", padx=8, pady=(14, 14))
+                fill="x", padx=8, pady=(18, 14))
 
             appear_row = ctk.CTkFrame(sc, fg_color="transparent")
             appear_row.pack(anchor="w", padx=8, pady=(0, 8))
@@ -1714,7 +1698,6 @@ if __name__ == "__main__":
             self._desc_var.set(s.get("describe_images", True))
             self._headless_var.set(s.get("headless", True))
             self._max_var.set(s.get("max_images", 30))
-            self._gh_token_var.set(get_api_key("github"))
             # Erscheinungsbild: intern "dark"/"light"/"system" → Label mit Emoji
             _mode_to_label = {"dark": "🌙  Dark", "light": "☀️  Light", "system": "🖥  System"}
             self._appear_var.set(_mode_to_label.get(s.get("appearance", "dark"), "🌙  Dark"))
@@ -1739,13 +1722,10 @@ if __name__ == "__main__":
             save_settings(s)
             oai = self._oai_var.get().strip()
             gem = self._gem_var.get().strip()
-            gh  = self._gh_token_var.get().strip()
             if oai:
                 set_api_key("openai", oai)
             if gem:
                 set_api_key("gemini", gem)
-            if gh:
-                set_api_key("github", gh)
             # Modus sofort anwenden (kein Neustart nötig)
             ctk.set_appearance_mode(appearance)
             messagebox.showinfo("Einstellungen", "Gespeichert.", parent=self)
@@ -2253,7 +2233,8 @@ if __name__ == "__main__":
 
         def _check_update(self):
             """Startet den Update-Check im Hintergrund (kein UI-Block)."""
-            token = get_api_key("github")
+            # Eingetragener Token hat Vorrang; sonst eingebetteter Fallback-Token
+            token = get_api_key("github") or GITHUB_UPDATE_TOKEN
             if not token:
                 return
             threading.Thread(target=self._check_update_bg,
@@ -2279,7 +2260,7 @@ if __name__ == "__main__":
                 self._run_update(new_ver, asset_url)
 
         def _run_update(self, new_ver: str, asset_url: str):
-            token = get_api_key("github")
+            token = get_api_key("github") or GITHUB_UPDATE_TOKEN
             try:
                 self._status_var.set(f"Lade Version {new_ver} herunter…")
                 self.update_idletasks()
