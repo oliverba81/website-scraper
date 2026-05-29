@@ -1999,6 +1999,11 @@ if __name__ == "__main__":
                 text="Extrahiert Webseiten vollständig als strukturierte Markdown-Dateien",
                 font=ctk.CTkFont(size=12), text_color="gray55", anchor="w",
             ).grid(row=1, column=0, sticky="w", padx=22, pady=(0, 14))
+            ctk.CTkLabel(
+                hdr,
+                text=f"v{APP_VERSION}",
+                font=ctk.CTkFont(size=11), text_color="gray50", anchor="e",
+            ).grid(row=1, column=0, sticky="e", padx=(0, 22), pady=(0, 14))
             ctk.CTkButton(
                 hdr, text="⚙  Einstellungen", command=self._open_settings,
                 width=148, height=34,
