@@ -5,5 +5,4 @@ requests
 openai
 google-genai
 keyring
-keyrings.alt
 customtkinter
