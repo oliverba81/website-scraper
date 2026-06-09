@@ -894,6 +894,26 @@ class Scraper:
             return
 
         if tag == "p":
+            # Absätze mit Bildern (z. B. <p><img></p>) getrennt ausgeben:
+            # Bilder als Bild-Block, Text als normalen Absatz.
+            if el.find("img"):
+                buf = ""
+                for ch in el.children:
+                    if isinstance(ch, Tag) and ch.name == "img":
+                        if buf.strip():
+                            out += ["", buf.strip(), ""]
+                        buf = ""
+                        self._img_block(ch, out)
+                    elif isinstance(ch, Tag) and ch.find("img"):
+                        if buf.strip():
+                            out += ["", buf.strip(), ""]
+                        buf = ""
+                        self._node(ch, out)
+                    else:
+                        buf += self._inline(ch)
+                if buf.strip():
+                    out += ["", buf.strip(), ""]
+                return
             txt = self._inline(el).strip()
             if txt:
                 out += ["", txt, ""]
