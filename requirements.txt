@@ -3,7 +3,6 @@ beautifulsoup4
 lxml
 requests
 anthropic
-google-genai
 keyring
 keyrings.alt
 customtkinter

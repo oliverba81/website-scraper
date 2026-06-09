@@ -2,7 +2,7 @@
 """
 Website Scraper → Markdown
 Extrahiert komplette Webseiten als strukturierte Markdown-Dateien.
-Bilder werden per Claude (Anthropic) oder Google Gemini detailliert beschrieben.
+Bilder werden per Claude (Anthropic) detailliert beschrieben.
 Unterstützt Einzel-URLs und XML-Sitemaps (inkl. Sitemap-Index, .gz).
 """
 
@@ -66,7 +66,6 @@ REQUIRED_PACKAGES = {
     "bs4": "beautifulsoup4",
     "lxml": "lxml",
     "anthropic": "anthropic",
-    "google.genai": "google-genai",
     "keyring": "keyring",
     "keyrings.alt": "keyrings.alt",
     "customtkinter": "customtkinter",
@@ -1154,8 +1153,7 @@ class Scraper:
     # ── KI-Bildbeschreibung ───────────────────────────────────────────────────
 
     def _describe_image(self, b64: str, mime_type: str, alt: str) -> str:
-        provider = self.settings.get("provider", "claude")
-        api_key = get_api_key(provider)
+        api_key = get_api_key("claude")
 
         if not api_key:
             return f"[Kein API-Key – Alt-Text: {alt}]" if alt else "[Kein API-Key konfiguriert]"
@@ -1174,10 +1172,7 @@ class Scraper:
 
         try:
             time.sleep(0.5)
-            if provider == "claude":
-                result = self._describe_claude(b64, mime_type, prompt)
-            else:
-                result = self._describe_gemini(b64, mime_type, prompt)
+            result = self._describe_claude(b64, mime_type, prompt)
             self._img_cache[cache_key] = result
             return result
         except Exception as exc:
@@ -1207,19 +1202,6 @@ class Scraper:
             }],
         )
         return resp.content[0].text.strip()
-
-    def _describe_gemini(self, b64: str, mime_type: str, prompt: str) -> str:
-        from google import genai
-        from google.genai import types
-        client = genai.Client(api_key=get_api_key("gemini"))
-        model_name = self.settings.get("gemini_model", "gemini-2.0-flash")
-        img_bytes = base64.b64decode(b64)
-        img_part = types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
-        resp = client.models.generate_content(
-            model=model_name,
-            contents=[img_part, prompt],
-        )
-        return resp.text
 
     # ── Listeneinträge ────────────────────────────────────────────────────────
 
@@ -1652,14 +1634,6 @@ if __name__ == "__main__":
             ai.columnconfigure(1, weight=1)
 
             row = 0
-            ctk.CTkLabel(ai, text="AI-Provider", anchor="w").grid(
-                row=row, column=0, sticky="w", padx=8, pady=8)
-            self._prov_var = tk.StringVar()
-            ctk.CTkComboBox(ai, variable=self._prov_var,
-                            values=["claude", "gemini"], width=180).grid(
-                row=row, column=1, sticky="w", padx=8, pady=8)
-            row += 1
-
             ctk.CTkLabel(ai, text="Anthropic API-Key",
                          font=ctk.CTkFont(weight="bold"), anchor="w").grid(
                 row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(12, 2))
@@ -1682,37 +1656,6 @@ if __name__ == "__main__":
                             values=["claude-haiku-4-5", "claude-sonnet-4-6",
                                     "claude-opus-4-8"], width=200).grid(
                 row=row, column=1, sticky="w", padx=8, pady=6)
-            row += 1
-
-            ctk.CTkFrame(ai, height=1, fg_color="gray35").grid(
-                row=row, column=0, columnspan=2, sticky="ew", padx=8, pady=10)
-            row += 1
-
-            ctk.CTkLabel(ai, text="Gemini API-Key",
-                         font=ctk.CTkFont(weight="bold"), anchor="w").grid(
-                row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2))
-            row += 1
-            self._gem_var = tk.StringVar()
-            gem_e = ctk.CTkEntry(ai, textvariable=self._gem_var, show="*", width=390)
-            gem_e.grid(row=row, column=0, columnspan=2, sticky="ew", padx=8)
-            row += 1
-            self._gem_show = tk.BooleanVar()
-            ctk.CTkCheckBox(
-                ai, text="Key anzeigen", variable=self._gem_show,
-                command=lambda: gem_e.configure(show="" if self._gem_show.get() else "*"),
-            ).grid(row=row, column=0, sticky="w", padx=8, pady=4)
-            row += 1
-
-            ctk.CTkLabel(ai, text="Modell", anchor="w").grid(
-                row=row, column=0, sticky="w", padx=8, pady=6)
-            self._gem_model_var = tk.StringVar()
-            ctk.CTkComboBox(
-                ai, variable=self._gem_model_var,
-                values=["gemini-2.0-flash", "gemini-2.0-flash-lite",
-                        "gemini-1.5-flash", "gemini-1.5-pro"],
-                width=200,
-            ).grid(row=row, column=1, sticky="w", padx=8, pady=6)
-
             # ── Scraper-Tab ───────────────────────────────────────────────────
             self._desc_var = tk.BooleanVar()
             ctk.CTkCheckBox(sc, text="Bilder mit AI beschreiben",
@@ -1763,9 +1706,7 @@ if __name__ == "__main__":
 
         def _load_values(self):
             s = load_settings()
-            self._prov_var.set(s.get("provider", "claude"))
             self._claude_model_var.set(s.get("claude_model", "claude-haiku-4-5"))
-            self._gem_model_var.set(s.get("gemini_model", "gemini-2.0-flash"))
             self._desc_var.set(s.get("describe_images", True))
             self._headless_var.set(s.get("headless", True))
             self._max_var.set(s.get("max_images", 30))
@@ -1773,13 +1714,10 @@ if __name__ == "__main__":
             _mode_to_label = {"dark": "🌙  Dark", "light": "☀️  Light", "system": "🖥  System"}
             self._appear_var.set(_mode_to_label.get(s.get("appearance", "dark"), "🌙  Dark"))
             self._claude_var.set(get_api_key("claude"))
-            self._gem_var.set(get_api_key("gemini"))
 
         def _save(self):
             s = load_settings()
-            s["provider"] = self._prov_var.get()
             s["claude_model"] = self._claude_model_var.get()
-            s["gemini_model"] = self._gem_model_var.get()
             s["describe_images"] = self._desc_var.get()
             s["headless"] = self._headless_var.get()
             try:
@@ -1792,11 +1730,8 @@ if __name__ == "__main__":
             s["appearance"] = appearance
             save_settings(s)
             claude = self._claude_var.get().strip()
-            gem = self._gem_var.get().strip()
             if claude:
                 set_api_key("claude", claude)
-            if gem:
-                set_api_key("gemini", gem)
             # Modus sofort anwenden (kein Neustart nötig)
             ctk.set_appearance_mode(appearance)
             _showmsg(self, "Einstellungen", "Gespeichert.")
