@@ -2,7 +2,7 @@ playwright
 beautifulsoup4
 lxml
 requests
-openai
+anthropic
 google-genai
 keyring
 keyrings.alt

@@ -2,7 +2,7 @@
 """
 Website Scraper → Markdown
 Extrahiert komplette Webseiten als strukturierte Markdown-Dateien.
-Bilder werden per OpenAI GPT-4o oder Google Gemini detailliert beschrieben.
+Bilder werden per Claude (Anthropic) oder Google Gemini detailliert beschrieben.
 Unterstützt Einzel-URLs und XML-Sitemaps (inkl. Sitemap-Index, .gz).
 """
 
@@ -65,7 +65,7 @@ REQUIRED_PACKAGES = {
     "playwright": "playwright",
     "bs4": "beautifulsoup4",
     "lxml": "lxml",
-    "openai": "openai",
+    "anthropic": "anthropic",
     "google.genai": "google-genai",
     "keyring": "keyring",
     "keyrings.alt": "keyrings.alt",
@@ -1154,7 +1154,7 @@ class Scraper:
     # ── KI-Bildbeschreibung ───────────────────────────────────────────────────
 
     def _describe_image(self, b64: str, mime_type: str, alt: str) -> str:
-        provider = self.settings.get("provider", "openai")
+        provider = self.settings.get("provider", "claude")
         api_key = get_api_key(provider)
 
         if not api_key:
@@ -1174,8 +1174,8 @@ class Scraper:
 
         try:
             time.sleep(0.5)
-            if provider == "openai":
-                result = self._describe_openai(b64, mime_type, prompt)
+            if provider == "claude":
+                result = self._describe_claude(b64, mime_type, prompt)
             else:
                 result = self._describe_gemini(b64, mime_type, prompt)
             self._img_cache[cache_key] = result
@@ -1184,25 +1184,29 @@ class Scraper:
             self._log(f"  Bildbeschreibungs-Fehler: {exc}")
             return f"[Bildbeschreibung fehlgeschlagen: {exc}]"
 
-    def _describe_openai(self, b64: str, mime_type: str, prompt: str) -> str:
-        import openai as _openai
-        client = _openai.OpenAI(api_key=get_api_key("openai"))
-        model = self.settings.get("openai_model", "gpt-4o")
-        resp = client.chat.completions.create(
+    def _describe_claude(self, b64: str, mime_type: str, prompt: str) -> str:
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=get_api_key("claude"))
+        model = self.settings.get("claude_model", "claude-haiku-4-5")
+        resp = client.messages.create(
             model=model,
             max_tokens=1500,
             messages=[{
                 "role": "user",
                 "content": [
                     {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime_type};base64,{b64}"},
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime_type,
+                            "data": b64,
+                        },
                     },
                     {"type": "text", "text": prompt},
                 ],
             }],
         )
-        return resp.choices[0].message.content
+        return resp.content[0].text.strip()
 
     def _describe_gemini(self, b64: str, mime_type: str, prompt: str) -> str:
         from google import genai
@@ -1652,30 +1656,31 @@ if __name__ == "__main__":
                 row=row, column=0, sticky="w", padx=8, pady=8)
             self._prov_var = tk.StringVar()
             ctk.CTkComboBox(ai, variable=self._prov_var,
-                            values=["openai", "gemini"], width=180).grid(
+                            values=["claude", "gemini"], width=180).grid(
                 row=row, column=1, sticky="w", padx=8, pady=8)
             row += 1
 
-            ctk.CTkLabel(ai, text="OpenAI API-Key",
+            ctk.CTkLabel(ai, text="Anthropic API-Key",
                          font=ctk.CTkFont(weight="bold"), anchor="w").grid(
                 row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(12, 2))
             row += 1
-            self._oai_var = tk.StringVar()
-            oai_e = ctk.CTkEntry(ai, textvariable=self._oai_var, show="*", width=390)
-            oai_e.grid(row=row, column=0, columnspan=2, sticky="ew", padx=8)
+            self._claude_var = tk.StringVar()
+            claude_e = ctk.CTkEntry(ai, textvariable=self._claude_var, show="*", width=390)
+            claude_e.grid(row=row, column=0, columnspan=2, sticky="ew", padx=8)
             row += 1
-            self._oai_show = tk.BooleanVar()
+            self._claude_show = tk.BooleanVar()
             ctk.CTkCheckBox(
-                ai, text="Key anzeigen", variable=self._oai_show,
-                command=lambda: oai_e.configure(show="" if self._oai_show.get() else "*"),
+                ai, text="Key anzeigen", variable=self._claude_show,
+                command=lambda: claude_e.configure(show="" if self._claude_show.get() else "*"),
             ).grid(row=row, column=0, sticky="w", padx=8, pady=4)
             row += 1
 
             ctk.CTkLabel(ai, text="Modell", anchor="w").grid(
                 row=row, column=0, sticky="w", padx=8, pady=6)
-            self._oai_model_var = tk.StringVar()
-            ctk.CTkComboBox(ai, variable=self._oai_model_var,
-                            values=["gpt-4o", "gpt-4o-mini"], width=180).grid(
+            self._claude_model_var = tk.StringVar()
+            ctk.CTkComboBox(ai, variable=self._claude_model_var,
+                            values=["claude-haiku-4-5", "claude-sonnet-4-6",
+                                    "claude-opus-4-8"], width=200).grid(
                 row=row, column=1, sticky="w", padx=8, pady=6)
             row += 1
 
@@ -1758,8 +1763,8 @@ if __name__ == "__main__":
 
         def _load_values(self):
             s = load_settings()
-            self._prov_var.set(s.get("provider", "openai"))
-            self._oai_model_var.set(s.get("openai_model", "gpt-4o"))
+            self._prov_var.set(s.get("provider", "claude"))
+            self._claude_model_var.set(s.get("claude_model", "claude-haiku-4-5"))
             self._gem_model_var.set(s.get("gemini_model", "gemini-2.0-flash"))
             self._desc_var.set(s.get("describe_images", True))
             self._headless_var.set(s.get("headless", True))
@@ -1767,13 +1772,13 @@ if __name__ == "__main__":
             # Erscheinungsbild: intern "dark"/"light"/"system" → Label mit Emoji
             _mode_to_label = {"dark": "🌙  Dark", "light": "☀️  Light", "system": "🖥  System"}
             self._appear_var.set(_mode_to_label.get(s.get("appearance", "dark"), "🌙  Dark"))
-            self._oai_var.set(get_api_key("openai"))
+            self._claude_var.set(get_api_key("claude"))
             self._gem_var.set(get_api_key("gemini"))
 
         def _save(self):
             s = load_settings()
             s["provider"] = self._prov_var.get()
-            s["openai_model"] = self._oai_model_var.get()
+            s["claude_model"] = self._claude_model_var.get()
             s["gemini_model"] = self._gem_model_var.get()
             s["describe_images"] = self._desc_var.get()
             s["headless"] = self._headless_var.get()
@@ -1786,10 +1791,10 @@ if __name__ == "__main__":
             appearance = _label_to_mode.get(self._appear_var.get(), "dark")
             s["appearance"] = appearance
             save_settings(s)
-            oai = self._oai_var.get().strip()
+            claude = self._claude_var.get().strip()
             gem = self._gem_var.get().strip()
-            if oai:
-                set_api_key("openai", oai)
+            if claude:
+                set_api_key("claude", claude)
             if gem:
                 set_api_key("gemini", gem)
             # Modus sofort anwenden (kein Neustart nötig)
