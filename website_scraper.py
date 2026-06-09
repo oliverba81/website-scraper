@@ -2473,14 +2473,13 @@ if __name__ == "__main__":
             mode = self._mode_var.get()
             settings = load_settings()
             settings["simulate"] = self._sim_var.get()
-            provider = settings.get("provider", "openai")
             describe = settings.get("describe_images", True)
             active_fmt = get_active_format()
 
-            if describe and not settings["simulate"] and not get_api_key(provider):
+            if describe and not settings["simulate"] and not get_api_key("claude"):
                 if not _askyn(
                     self, "Kein API-Key",
-                    f"Für Provider '{provider}' wurde kein API-Key konfiguriert.\n"
+                    "Kein Anthropic API-Key konfiguriert.\n"
                     "Bilder werden ohne AI-Beschreibung dokumentiert.\n\n"
                     "Trotzdem fortfahren?",
                 ):
