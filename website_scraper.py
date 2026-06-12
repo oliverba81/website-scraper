@@ -219,6 +219,79 @@ def save_settings(data: dict):
     SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+# ─── Sitemap-Queue (wiederaufnehmbare Abarbeitung) ────────────────────────────
+
+QUEUE_FILENAME = "_queue.json"
+QUEUE_SCHEMA   = 1
+
+
+def _queue_path(output_dir) -> Path:
+    return Path(output_dir) / QUEUE_FILENAME
+
+
+def _load_queue(output_dir, log_fn=None) -> dict:
+    """Lädt _queue.json. Gibt None zurück bei Fehler/falschem Schema.
+
+    all_urls wird order-preserving dedupliziert, done auf all_urls geschnitten –
+    so sind die Werte für Resume-Dialog und Worker identisch und robust gegen
+    geschrumpfte oder manuell editierte Queues.
+    """
+    try:
+        path = _queue_path(output_dir)
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("schema_version") != QUEUE_SCHEMA:
+            return None
+        all_urls = data.get("all_urls")
+        done     = data.get("done")
+        if not isinstance(all_urls, list) or not all_urls or not isinstance(done, list):
+            return None
+        data["all_urls"] = list(dict.fromkeys(all_urls))
+        data["done"]     = [u for u in data["all_urls"] if u in set(done)]
+        return data
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"Queue konnte nicht gelesen werden ({exc}) – starte neu.")
+        return None
+
+
+def _write_queue_atomic(output_dir, data: dict, log_fn=None):
+    """Schreibt _queue.json atomar (temp + os.replace). Nicht-fatal:
+
+    Ein OneDrive-Lock / PermissionError / Disk-voll bricht den Lauf NICHT ab –
+    die Seite ist bereits erfolgreich geschrieben; im schlimmsten Fall wird sie
+    bei einer Wiederaufnahme erneut verarbeitet.
+    """
+    target = _queue_path(output_dir)
+    tmp    = target.with_suffix(target.suffix + ".tmp")   # _queue.json.tmp, selbes Verzeichnis
+    for attempt in range(3):
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, target)                       # os.replace im try (OneDrive lockt v.a. das Ziel)
+            return
+        except OSError:
+            time.sleep(0.1 * (attempt + 1))               # Worker-Thread, blockiert die GUI nicht
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if log_fn:
+        log_fn("Queue-Stand konnte nicht gespeichert werden – "
+               "bei Wiederaufnahme werden ggf. einige Seiten erneut verarbeitet.")
+
+
+def _delete_queue(output_dir):
+    """Entfernt _queue.json und eine evtl. übrig gebliebene _queue.json.tmp."""
+    target = _queue_path(output_dir)
+    for p in (target, target.with_suffix(target.suffix + ".tmp")):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _default_formats() -> list:
     """Gibt die 3 vorinstallierten Ausgabeformate zurück."""
     return [
@@ -1310,7 +1383,9 @@ if __name__ == "__main__":
 
         def __init__(self, parent, title: str, message: str, kind: str = "ok"):
             super().__init__(parent)
-            self.result = False
+            # None = Dialog geschlossen (Fenster-X/Escape) → sichere Variante,
+            # False = explizit "Nein", True = explizit "Ja".
+            self.result = None
             self.title(title)
             self.resizable(False, False)
             self.transient(parent)
@@ -1334,7 +1409,7 @@ if __name__ == "__main__":
                     btn, text="Nein", width=92, height=32,
                     fg_color="transparent", border_width=1,
                     text_color=("gray10", "gray90"),
-                    command=self.destroy,
+                    command=self._no,
                 ).pack(side="left", padx=(0, 8))
                 ctk.CTkButton(
                     btn, text="Ja", width=92, height=32,
@@ -1348,6 +1423,10 @@ if __name__ == "__main__":
 
         def _yes(self):
             self.result = True
+            self.destroy()
+
+        def _no(self):
+            self.result = False
             self.destroy()
 
         def _center(self, parent):
@@ -2198,6 +2277,15 @@ if __name__ == "__main__":
                 text_color=("gray10", "gray90"),
             )
             self._open_btn.pack(side="left")
+
+            # Nur im Sitemap-Modus sichtbar (durch _mode_changed ein-/ausgeblendet);
+            # öffnet die _queue.json (offene Restliste) im Ausgabeordner.
+            self._queue_btn = ctk.CTkButton(
+                btn_row, text="📋  Liste", command=self._open_queue,
+                width=104, height=38,
+                fg_color="transparent", border_width=1,
+                text_color=("gray10", "gray90"),
+            )
             r += 1
 
             # Fortschritts-Karte
@@ -2304,12 +2392,16 @@ if __name__ == "__main__":
                 self._open_btn.configure(text="📁  Öffnen")
                 self._sep.grid()
                 self._sitemap_sub.grid()
+                self._queue_btn.pack(side="left", padx=(8, 0))
             else:
                 self._out_label.configure(text="Ausgabedatei")
                 self._open_btn.configure(text="📄  Öffnen")
                 self._sep.grid_remove()
                 self._sitemap_sub.grid_remove()
-            self._out_var.set("")
+                self._queue_btn.pack_forget()
+            # Zuletzt genutzten Pfad pro Modus wiederherstellen (statt leeren),
+            # damit eine Wiederaufnahme im selben Ordner zuverlässig greift.
+            self._out_var.set(load_settings().get(f"last_output_{mode}", ""))
 
         # ── UI-Helfer ─────────────────────────────────────────────────────────
 
@@ -2346,6 +2438,17 @@ if __name__ == "__main__":
                 os.startfile(path)
             except OSError:
                 subprocess.Popen(["explorer", "/select,", path])
+
+        def _open_queue(self):
+            out = self._out_var.get().strip()
+            if not out:
+                _showmsg(self, "Hinweis", "Kein Ausgabeordner angegeben.")
+                return
+            qp = _queue_path(out)
+            if not qp.exists():
+                _showmsg(self, "Hinweis", "Keine offene Liste vorhanden.")
+                return
+            self._open_or_reveal(str(qp))
 
         def _open_settings(self):
             SettingsDialog(self)
@@ -2427,8 +2530,7 @@ if __name__ == "__main__":
             self._url_var.set(s.get("last_url", ""))
             mode = s.get("last_mode", "single")
             self._mode_var.set(mode)
-            self._mode_changed()
-            self._out_var.set(s.get(f"last_output_{mode}", ""))
+            self._mode_changed()   # stellt _out_var aus last_output_{mode} wieder her
             # Simulationsmodus immer deaktiviert starten (nie persistieren)
             self._sim_var.set(False)
 
@@ -2481,6 +2583,8 @@ if __name__ == "__main__":
         # ── Extraktion starten / abbrechen ────────────────────────────────────
 
         def _start(self):
+            if self._running:
+                return
             url = self._url_var.get().strip()
             if not url:
                 _showmsg(self, "Hinweis", "Bitte URL eingeben.")
@@ -2505,13 +2609,36 @@ if __name__ == "__main__":
                 ):
                     return
 
+            resume = False
             if mode == "sitemap":
                 if not output:
                     parsed = urlparse(url)
                     stem = re.sub(r"[^\w\-]", "_", parsed.netloc)
                     output = str(Path.home() / "Documents" / stem)
                     self._out_var.set(output)
-                Path(output).mkdir(parents=True, exist_ok=True)
+                try:
+                    Path(output).mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    _showmsg(self, "Fehler",
+                             f"Ausgabeordner konnte nicht angelegt werden:\n{exc}")
+                    return
+
+                # Unterbrochenen Lauf erkennen und ggf. fortsetzen (vor jeder
+                # State-Mutation – ein versehentliches Schließen darf nichts ändern).
+                q = _load_queue(output, self._log_ui)
+                if (q and q.get("sitemap_url") == url
+                        and q.get("format_ext") == active_fmt.get("extension", ".md")
+                        and 0 < len(q["done"]) < len(q["all_urls"])):
+                    ans = _MsgBox(
+                        self, "Unterbrochener Lauf",
+                        f"{len(q['done'])} von {len(q['all_urls'])} Seiten in diesem "
+                        f"Ordner sind bereits erledigt.\n\n"
+                        f"Lauf fortsetzen?\n(Nein = neu starten)",
+                        "yesno",
+                    ).result
+                    if ans is None:
+                        return            # Dialog geschlossen → Start abbrechen, nichts verändern
+                    resume = bool(ans)    # True = fortsetzen, False = neu starten
             else:
                 if not output:
                     parsed = urlparse(url)
@@ -2539,7 +2666,7 @@ if __name__ == "__main__":
                 self._avg_var.set("")
                 self._sitemap_bar.set(0)
                 threading.Thread(target=self._worker_sitemap,
-                                 args=(url, output, settings), daemon=True).start()
+                                 args=(url, output, settings, resume), daemon=True).start()
             else:
                 threading.Thread(target=self._worker,
                                  args=(url, output, settings), daemon=True).start()
@@ -2569,10 +2696,27 @@ if __name__ == "__main__":
 
         # ── Worker: Sitemap ───────────────────────────────────────────────────
 
-        def _worker_sitemap(self, sitemap_url: str, output_dir: str, settings: dict):
+        def _worker_sitemap(self, sitemap_url: str, output_dir: str,
+                            settings: dict, resume: bool = False):
             try:
+                out_path = Path(output_dir)
+                fmt      = get_active_format()
+                fmt_ext  = fmt.get("extension", ".md")
+
                 self._log(f"Verarbeite Sitemap: {sitemap_url}")
-                urls = _fetch_sitemap_urls(sitemap_url, self._log)
+                try:
+                    urls = list(dict.fromkeys(_fetch_sitemap_urls(sitemap_url, self._log)))
+                except Exception as exc:
+                    self._log(f"Sitemap konnte nicht geladen werden: {exc}")
+                    urls = []
+
+                # Offline-Fallback: bei Wiederaufnahme die gespeicherte Liste nutzen,
+                # falls der frische Fetch leer/fehlerhaft war.
+                q = _load_queue(output_dir, self._log) if resume else None
+                if not urls and q:
+                    urls = q["all_urls"]
+                    self._log("Verwende gespeicherte Liste aus der Wiederaufnahme.")
+
                 if self._stop_event.is_set():
                     self.after(0, self._cancelled)
                     return
@@ -2584,18 +2728,33 @@ if __name__ == "__main__":
                         "• Manche Seiten haben /sitemap_index.xml")
                     return
 
-                self._log(f"Sitemap geladen: {total} Seiten gefunden")
-                self.after(0, self._update_sitemap_progress, 0, total, [])
+                done = set(q["done"]) & set(urls) if q else set()
+                self._log(f"Sitemap geladen: {total} Seiten gefunden"
+                          + (f" · {len(done)} bereits erledigt (Wiederaufnahme)" if done else ""))
+
+                def _save_state():
+                    _write_queue_atomic(output_dir, {
+                        "schema_version": QUEUE_SCHEMA,
+                        "sitemap_url": sitemap_url,
+                        "format_ext": fmt_ext,
+                        "created": time.strftime("%Y-%m-%d %H:%M"),
+                        "all_urls": urls,
+                        "done": [u for u in urls if u in done],
+                    }, self._log)
+
+                # "Im Hintergrund aufrufbare Liste" sofort persistieren.
+                _save_state()
+
                 page_times: list = []
-                failed_urls: list = []
-                out_path = Path(output_dir)
-                fmt      = get_active_format()
-                fmt_ext  = fmt.get("extension", ".md")
+                # Einmaliger Initial-Push (erledigte als Startoffset); Skips lösen
+                # danach keine weiteren UI-Updates aus (verhindert GUI-Fluten).
+                self.after(0, self._update_sitemap_progress, len(done), total, page_times)
 
                 for i, url in enumerate(urls):
                     if self._stop_event.is_set():
                         break
-                    self.after(0, self._update_sitemap_progress, i, total, page_times)
+                    if url in done:
+                        continue
                     self._log(f"\n[{i + 1}/{total}] {url}")
                     self._set_progress(0)
                     file_path = str(out_path / _url_to_filename(url, fmt_ext))
@@ -2605,25 +2764,33 @@ if __name__ == "__main__":
                                           progress_fn=self._set_progress,
                                           stop_event=self._stop_event)
                         scraper.run(url, file_path, output_format=fmt)
-                        page_times.append(time.time() - t0)
                     except Exception as exc:
                         self._log(f"  FEHLER: {exc}")
-                        failed_urls.append(url)
+                        continue   # bleibt pending → Retry bei Wiederaufnahme
+                    # Scraper.run bricht bei Stop still ab (kein write_text, keine
+                    # Exception) → erst NACH dem Stop-Check als erledigt markieren.
+                    if self._stop_event.is_set():
+                        break
+                    done.add(url)
+                    page_times.append(time.time() - t0)
+                    self.after(0, self._update_sitemap_progress, len(done), total, page_times)
+                    _save_state()
 
-                self.after(0, self._update_sitemap_progress,
-                           min(i + 1, total), total, page_times)
+                self.after(0, self._update_sitemap_progress, len(done), total, page_times)
                 if not self._stop_event.is_set():
-                    failed_set_local = set(failed_urls)
-                    md_paths = [
-                        str(out_path / _url_to_filename(u, fmt_ext))
-                        for u in urls if u not in failed_set_local
-                    ]
-                    self._write_index(out_path, sitemap_url, urls, failed_urls,
-                                      page_times, ext=fmt_ext)
+                    failed = [u for u in urls if u not in done]
+                    md_paths = [str(out_path / _url_to_filename(u, fmt_ext))
+                                for u in urls if u in done]
+                    try:
+                        self._write_index(out_path, sitemap_url, urls, failed,
+                                          page_times, ext=fmt_ext)
+                    except Exception as exc:
+                        self._log(f"Index-Fehler (ignoriert): {exc}")
+                    _delete_queue(output_dir)   # durchgelaufen → fertig
                     self.after(0, self._done_sitemap,
-                               output_dir, total, failed_urls, page_times, md_paths)
+                               output_dir, total, failed, page_times, md_paths)
                 else:
-                    self.after(0, self._cancelled)
+                    self.after(0, self._cancelled)   # Queue bleibt erhalten → Wiederaufnahme
             except Exception as exc:
                 import traceback
                 self._log(f"FEHLER: {exc}\n{traceback.format_exc()}")
