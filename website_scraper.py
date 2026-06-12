@@ -2286,6 +2286,13 @@ if __name__ == "__main__":
                 fg_color="transparent", border_width=1,
                 text_color=("gray10", "gray90"),
             )
+            # Verwirft den gespeicherten Wiederaufnahme-Stand (_queue.json) des Ordners.
+            self._discard_btn = ctk.CTkButton(
+                btn_row, text="🗑  Verwerfen", command=self._discard_queue,
+                width=120, height=38,
+                fg_color="transparent", border_width=1,
+                text_color=("gray10", "gray90"),
+            )
             r += 1
 
             # Fortschritts-Karte
@@ -2393,12 +2400,14 @@ if __name__ == "__main__":
                 self._sep.grid()
                 self._sitemap_sub.grid()
                 self._queue_btn.pack(side="left", padx=(8, 0))
+                self._discard_btn.pack(side="left", padx=(8, 0))
             else:
                 self._out_label.configure(text="Ausgabedatei")
                 self._open_btn.configure(text="📄  Öffnen")
                 self._sep.grid_remove()
                 self._sitemap_sub.grid_remove()
                 self._queue_btn.pack_forget()
+                self._discard_btn.pack_forget()
             # Zuletzt genutzten Pfad pro Modus wiederherstellen (statt leeren),
             # damit eine Wiederaufnahme im selben Ordner zuverlässig greift.
             self._out_var.set(load_settings().get(f"last_output_{mode}", ""))
@@ -2449,6 +2458,29 @@ if __name__ == "__main__":
                 _showmsg(self, "Hinweis", "Keine offene Liste vorhanden.")
                 return
             self._open_or_reveal(str(qp))
+
+        def _discard_queue(self):
+            if self._running:
+                _showmsg(self, "Hinweis",
+                         "Während eines laufenden Vorgangs nicht möglich.")
+                return
+            out = self._out_var.get().strip()
+            if not out:
+                _showmsg(self, "Hinweis", "Kein Ausgabeordner angegeben.")
+                return
+            qp = _queue_path(out)
+            if not qp.exists():
+                _showmsg(self, "Hinweis", "Keine offene Liste vorhanden.")
+                return
+            if _askyn(
+                self, "Lauf verwerfen",
+                "Den gespeicherten Wiederaufnahme-Stand für diesen Ordner verwerfen?\n\n"
+                "Bereits erzeugte Dateien bleiben erhalten – nur die Restliste "
+                "(_queue.json) wird gelöscht.",
+            ):
+                _delete_queue(out)
+                self._log_ui("Wiederaufnahme-Stand verworfen.")
+                _showmsg(self, "Verworfen", "Die offene Liste wurde gelöscht.")
 
         def _open_settings(self):
             SettingsDialog(self)
