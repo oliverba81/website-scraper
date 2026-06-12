@@ -682,15 +682,16 @@ class Scraper:
             return
 
         self._progress(42)
-        self._log("Konvertiere Inhalt zu Markdown…")
+        fmt      = output_format or {"type": "markdown", "extension": ".md"}
+        fmt_type = fmt.get("type", "markdown")
+        _label   = {"xml": "XML", "csv": "CSV"}.get(fmt_type, "Markdown")
+        self._log(f"Konvertiere Inhalt zu {_label}…")
 
         md = self._to_markdown(html, img_data)
         if self._stop.is_set():
             return
 
         self._progress(95)
-        fmt      = output_format or {"type": "markdown", "extension": ".md"}
-        fmt_type = fmt.get("type", "markdown")
         if fmt_type == "xml":
             content = self._render_xml(md, html, fmt)
         elif fmt_type == "csv":
