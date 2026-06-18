@@ -26,7 +26,7 @@ from xml.etree import ElementTree as ET
 # ─── Konstanten ──────────────────────────────────────────────────────────────
 
 APP_NAME    = "website_scraper"
-APP_VERSION = "1.0.14"
+APP_VERSION = "1.0.16"
 SETTINGS_FILE = Path.home() / f".{APP_NAME}_settings.json"
 
 GITHUB_REPO     = "oliverba81/website-scraper"
@@ -60,6 +60,18 @@ ALL_FORMAT_FIELDS  = [
     "title", "url", "content", "text",
     "meta_description", "date", "images_count",
 ]
+
+# Version der Builtin-Format-Defaults; erhöht eine einmalige Migration in
+# get_formats() (z. B. CSV-Trennzeichen Komma → Semikolon für dt. Excel).
+FORMATS_REV = 1
+
+# C0-Steuerzeichen (außer \t \n \r) entfernen: brechen sonst Excel-Zellen bzw.
+# machen XML nicht wohlgeformt (xml.sax.saxutils.escape entfernt sie NICHT).
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _strip_ctrl(s: str) -> str:
+    return _CTRL_RE.sub("", str(s))
 
 REQUIRED_PACKAGES = {
     "playwright": "playwright",
@@ -306,7 +318,7 @@ def _default_formats() -> list:
         {"id": "builtin_csv", "name": "CSV",  "type": "csv",
          "extension": ".csv", "template": "",
          "fields": list(DEFAULT_CSV_FIELDS),
-         "params": {"delimiter": ",", "quotechar": '"', "include_header": True},
+         "params": {"delimiter": ";", "quotechar": '"', "include_header": True},
          "builtin": False},
     ]
 
@@ -318,6 +330,18 @@ def get_formats() -> list:
     if not fmts:
         fmts = _default_formats()
         s["formats"] = fmts
+        s["formats_rev"] = FORMATS_REV
+        save_settings(s)
+        return fmts
+    # Einmalige Migration (via Versionsflag, NICHT bei jeder Extraktion): das
+    # alte Komma-Trennzeichen des Builtin-CSV-Formats ging in dt. Excel nicht als
+    # Tabelle auf. Läuft genau einmal → spätere bewusste Editor-Wahl bleibt.
+    if s.get("formats_rev", 0) < FORMATS_REV:
+        for f in fmts:
+            if f.get("id") == "builtin_csv" and f.get("params", {}).get("delimiter") == ",":
+                f["params"]["delimiter"] = ";"
+        s["formats"] = fmts
+        s["formats_rev"] = FORMATS_REV
         save_settings(s)
     return fmts
 
@@ -658,15 +682,16 @@ class Scraper:
             return
 
         self._progress(42)
-        self._log("Konvertiere Inhalt zu Markdown…")
+        fmt      = output_format or {"type": "markdown", "extension": ".md"}
+        fmt_type = fmt.get("type", "markdown")
+        _label   = {"xml": "XML", "csv": "CSV"}.get(fmt_type, "Markdown")
+        self._log(f"Konvertiere Inhalt zu {_label}…")
 
         md = self._to_markdown(html, img_data)
         if self._stop.is_set():
             return
 
         self._progress(95)
-        fmt      = output_format or {"type": "markdown", "extension": ".md"}
-        fmt_type = fmt.get("type", "markdown")
         if fmt_type == "xml":
             content = self._render_xml(md, html, fmt)
         elif fmt_type == "csv":
@@ -678,8 +703,16 @@ class Scraper:
                 content = _apply_template(template, vars_)
             else:
                 content = md
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(output_path).write_text(content, encoding="utf-8")
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if fmt_type == "csv":
+            # utf-8-sig (BOM, genau 1×) → Excel erkennt UTF-8; newline="" → die
+            # \r\n von csv.writer werden nicht erneut übersetzt (sonst \r\r\n,
+            # was Excels Quote-Parsing bricht).
+            with open(out, "w", encoding="utf-8-sig", newline="") as f:
+                f.write(content)
+        else:
+            out.write_text(content, encoding="utf-8")
         self._log(f"Gespeichert: {output_path}")
         self._progress(100)
 
@@ -708,28 +741,55 @@ class Scraper:
         }
 
     def _render_xml(self, md: str, html: str, fmt: dict) -> str:
-        """Rendert die Seite als XML gemäß Format-Template."""
+        """Rendert die Seite als wohlgeformtes XML gemäß Format-Template.
+
+        Steuerzeichen werden gefiltert, Feldwerte XML-escaped. Steht
+        {{content}} in einem CDATA-Block, wird der Content NICHT escaped,
+        sondern nur ]]> CDATA-sicher gemacht.
+        """
+        from xml.sax.saxutils import escape
         data     = self._extract_page_vars(md, html)
         template = fmt.get("template", "") or DEFAULT_XML_TEMPLATE
-        return _apply_template(template, data)
+        content_in_cdata = bool(
+            re.search(r"<!\[CDATA\[(?:(?!\]\]>).)*\{\{content\}\}", template, re.S)
+        )
+        out = {}
+        for k, v in data.items():
+            s = _strip_ctrl(v)
+            if k == "content" and content_in_cdata:
+                out[k] = s.replace("]]>", "]]]]><![CDATA[>")
+            else:
+                out[k] = escape(s, {'"': "&quot;", "'": "&apos;"})
+        # Einmalige Ersetzung → keine Platzhalter-Injection durch Feldinhalte.
+        return re.sub(r"\{\{(\w+)\}\}",
+                      lambda m: out.get(m.group(1), m.group(0)), template)
 
     def _render_csv(self, md: str, html: str, fmt: dict) -> str:
         """Rendert die Seite als CSV-Zeile gemäß Format-Konfiguration."""
         import csv as _csv
         import io
+
+        def _csv_safe(v) -> str:
+            v = _strip_ctrl(v)
+            # CSV-Formula-Injection: Excel wertet =,+,-,@ am Zellanfang als Formel
+            # aus (QUOTE_ALL schützt davor NICHT). Führendes ' macht die Zelle Text.
+            if v[:1] in ("=", "+", "-", "@", "\t", "\r"):
+                v = "'" + v
+            return v
+
         data   = self._extract_page_vars(md, html)
         params = fmt.get("params", {})
         fields = fmt.get("fields", DEFAULT_CSV_FIELDS) or DEFAULT_CSV_FIELDS
         buf    = io.StringIO()
         writer = _csv.writer(
             buf,
-            delimiter=params.get("delimiter", ","),
+            delimiter=params.get("delimiter") or ";",
             quotechar=params.get("quotechar", '"'),
             quoting=_csv.QUOTE_ALL,
         )
         if params.get("include_header", True):
             writer.writerow(fields)
-        writer.writerow([data.get(f, "") for f in fields])
+        writer.writerow([_csv_safe(data.get(f, "")) for f in fields])
         return buf.getvalue()
 
     # ── Browser ──────────────────────────────────────────────────────────────
@@ -1576,7 +1636,7 @@ if __name__ == "__main__":
             ctk.CTkLabel(
                 self._csv_frame, text="Trennzeichen:", anchor="w",
             ).grid(row=1, column=0, sticky="w", padx=8, pady=2)
-            self._delim_var = tk.StringVar(value=",")
+            self._delim_var = tk.StringVar(value=";")
             ctk.CTkEntry(
                 self._csv_frame, textvariable=self._delim_var, width=48,
             ).grid(row=1, column=1, sticky="w", padx=4, pady=2)
@@ -1657,7 +1717,7 @@ if __name__ == "__main__":
             for fld, var in self._field_vars.items():
                 var.set(fld in fmt.get("fields", []))
             params = fmt.get("params", {})
-            self._delim_var.set(params.get("delimiter", ","))
+            self._delim_var.set(params.get("delimiter", ";"))
             self._quote_var.set(params.get("quotechar", '"'))
             self._header_var.set(params.get("include_header", True))
             self._root_var.set(params.get("root_element", "page"))
@@ -1678,7 +1738,7 @@ if __name__ == "__main__":
             params: dict = {}
             if t == "csv":
                 params = {
-                    "delimiter":      self._delim_var.get() or ",",
+                    "delimiter":      self._delim_var.get() or ";",
                     "quotechar":      self._quote_var.get() or '"',
                     "include_header": self._header_var.get(),
                 }
