@@ -897,6 +897,53 @@ class Scraper:
 
     # ── HTML → Markdown ───────────────────────────────────────────────────────
 
+    # Content-Container-Tokens nach Aussagekraft gestaffelt (durch -, _, Leerzeichen
+    # getrennt). "content" ist das verlässlichste Signal und wird zuerst geprüft;
+    # erst danach "main/article/entry/post". So gewinnt z. B. "article--content"
+    # gegen "article-count" oder "article--teaser".
+    _CONTENT_TIERS = [
+        re.compile(r"(?:^|[-_ ])content(?:[-_ ]|$)", re.I),
+        re.compile(r"(?:^|[-_ ])(main|article|entry|post)(?:[-_ ]|$)", re.I),
+    ]
+    # Navigations-/Rahmen-Elemente, die NIE als Content-Wurzel taugen.
+    # Schützt vor Klassen wie "gh-g-navigation--main-panel" (enthält "main").
+    _NAVISH_RE = re.compile(
+        r"\b(nav|navigation|menu|header|footer|breadcrumb|sidebar)\b", re.I
+    )
+
+    def _is_navish(self, el) -> bool:
+        """True, wenn das Element zur Navigation/Rahmenstruktur gehört."""
+        if (el.name or "").lower() in ("nav", "header", "footer"):
+            return True
+        haystack = " ".join(el.get("class") or []) + " " + (el.get("id") or "")
+        return bool(self._NAVISH_RE.search(haystack))
+
+    def _find_content_root(self, soup):
+        """Findet den Haupt-Inhaltscontainer und überspringt Navigations-Elemente.
+
+        Frühere Heuristik (\\b(content|main|article)\\b) matchte fälschlich
+        Navigations-IDs wie 'gh-g-navigation--main', weil Bindestriche als
+        Wortgrenzen zählen – die <nav> wurde als Wurzel gewählt und in _node
+        sofort verworfen → leere Ausgabe.
+        """
+        for tag in ("main", "article"):
+            el = soup.find(tag)
+            if el is not None:
+                return el
+        # Pro Stufe alle nicht-navigationsartigen Treffer sammeln und den
+        # textreichsten wählen (robust gegen kleine Teaser-/Zähler-Container).
+        for pattern in self._CONTENT_TIERS:
+            matches = []
+            seen = set()
+            for el in soup.find_all(class_=pattern) + soup.find_all(id=pattern):
+                if id(el) in seen or self._is_navish(el):
+                    continue
+                seen.add(id(el))
+                matches.append(el)
+            if matches:
+                return max(matches, key=lambda e: len(e.get_text(strip=True)))
+        return soup.body or soup
+
     def _to_markdown(self, html: str, img_data: dict) -> str:
         try:
             from bs4 import BeautifulSoup
@@ -919,14 +966,7 @@ class Scraper:
         _body = soup.body or soup
         self._img_pos_map = {id(el): i for i, el in enumerate(_body.find_all("img"))}
 
-        root = (
-            soup.find("main")
-            or soup.find("article")
-            or soup.find(id=re.compile(r"\b(content|main|article)\b", re.I))
-            or soup.find("div", class_=re.compile(r"\b(content|main|article)\b", re.I))
-            or soup.body
-            or soup
-        )
+        root = self._find_content_root(soup)
 
         self._img_data = img_data
         self._img_counter = [0]
