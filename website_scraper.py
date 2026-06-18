@@ -1118,10 +1118,19 @@ class Scraper:
             return
 
         if tag == "figure":
+            # <figure> umschließt nicht nur Bilder: WordPress & Co. verpacken
+            # auch Tabellen (figure.wp-block-table), Code (wp-block-code), Listen
+            # usw. in <figure>. Nur eine echte Bild-Figur als Bild-Block rendern;
+            # enthält die Figur Block-Inhalt (z. B. eine Tabelle), als Container
+            # rekursiv verarbeiten – sonst ginge der gesamte Inhalt verloren.
+            block_child = el.find(["table", "pre", "blockquote", "ul", "ol", "iframe"])
             img = el.find("img")
             cap = el.find("figcaption")
-            if img:
+            if img is not None and block_child is None:
                 self._img_block(img, out, caption=self._inline(cap).strip() if cap else "")
+            else:
+                for ch in el.children:
+                    self._node(ch, out)
             return
 
         if tag == "table":
