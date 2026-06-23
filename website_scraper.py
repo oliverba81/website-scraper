@@ -1024,6 +1024,13 @@ class Scraper:
                             const src = (img.complete ? img.currentSrc : '') || img.src ||
                                         img.getAttribute('data-src') ||
                                         img.getAttribute('data-lazy-src') || '';
+                            // Klassen von Bild + bis zu 2 Vorfahren (für Deko-Heuristik)
+                            let cls = (typeof img.className === 'string' ? img.className : '');
+                            let n = img.parentElement, lvl = 0;
+                            while (n && lvl < 2) {
+                                cls += ' ' + (typeof n.className === 'string' ? n.className : '');
+                                n = n.parentElement; lvl++;
+                            }
                             return {
                                 idx: idx,
                                 src: src,
@@ -1033,6 +1040,7 @@ class Scraper:
                                 height: h,
                                 dispW: img.offsetWidth,
                                 dispH: img.offsetHeight,
+                                container: cls.slice(0, 300),
                                 complete: img.complete
                             };
                         });
@@ -1044,6 +1052,7 @@ class Scraper:
                     # auf Icon-Maß verkleinertes SVG ist trotzdem Deko. Wenn die
                     # Anzeigegröße (noch) 0 ist, dient die natürliche Größe als Ersatz.
                     min_describe = int(self.settings.get("min_describe_px", 64))
+                    skip_deco    = self.settings.get("skip_decorative_images", True)
 
                     def _describe_size(info):
                         dw, dh = info.get("dispW", 0), info.get("dispH", 0)
@@ -1054,18 +1063,24 @@ class Scraper:
                     # SVGs werden NICHT mehr ausgeschlossen – sie können nicht direkt
                     # an die Vision-API gehen, werden aber in _download_image per
                     # Element-Screenshot zu PNG gerendert.
-                    candidates = [
-                        info for info in img_infos
-                        if info["src"]
-                        and info["width"] >= 30
-                        and info["height"] >= 30
-                        and _describe_size(info) >= min_describe
-                    ][:max_imgs]
+                    candidates, deco_skipped = [], 0
+                    for info in img_infos:
+                        if not (info["src"] and info["width"] >= 30
+                                and info["height"] >= 30
+                                and _describe_size(info) >= min_describe):
+                            continue
+                        if skip_deco and self._is_decorative(info):
+                            deco_skipped += 1
+                            continue
+                        candidates.append(info)
+                        if len(candidates) >= max_imgs:
+                            break
 
                     total = len(candidates)
                     incomplete = sum(1 for i in img_infos if not i.get("complete", True) and i["src"])
                     skip_info = f" · {incomplete} noch nicht fertig geladen" if incomplete else ""
-                    self._log(f"Lade {total} Bilder… (von {len(img_infos)} img-Elementen{skip_info})")
+                    deco_info = f" · {deco_skipped} Deko (Logo/Icon) übersprungen" if deco_skipped else ""
+                    self._log(f"Lade {total} Bilder… (von {len(img_infos)} img-Elementen{skip_info}{deco_info})")
 
                     for i, info in enumerate(candidates):
                         if self._stop.is_set():
@@ -1097,6 +1112,21 @@ class Scraper:
             iterations += 1
         page.evaluate("window.scrollTo(0, 0)")
         page.wait_for_timeout(300)
+
+    # Deko-Heuristik (größenunabhängig): Bilder überspringen, die nach Logo/Icon
+    # aussehen. Container-Klassen sind das verlässlichste Signal; beim Dateinamen
+    # bewusst KEIN "ico"/"icon" (zu mehrdeutig – z. B. heißen echte Screenshots
+    # auf manchen Seiten "ico_sage_main.svg").
+    _DECO_CLASS_RE = re.compile(r"\b(icon|logo|avatar|sprite|glyph|badge)\b", re.I)
+    _DECO_FILE_RE  = re.compile(r"(logo|avatar|sprite|favicon|badge)", re.I)
+
+    def _is_decorative(self, info: dict) -> bool:
+        """True, wenn das Bild nach Logo/Icon/Deko aussieht (Container-Klasse
+        oder Dateiname). Greift größenunabhängig zusätzlich zum Größenfilter."""
+        if self._DECO_CLASS_RE.search(info.get("container", "")):
+            return True
+        fname = (info.get("src", "") or "").rsplit("/", 1)[-1].lower()
+        return bool(self._DECO_FILE_RE.search(fname))
 
     def _screenshot_image(self, page, idx: int):
         """Rendert ein <img>-Element (z. B. SVG) per Element-Screenshot zu PNG.
@@ -2117,6 +2147,13 @@ if __name__ == "__main__":
                          text_color="gray55",
                          font=ctk.CTkFont(size=11)).pack(side="left")
 
+            self._skipdeco_var = tk.BooleanVar(value=True)
+            ctk.CTkCheckBox(sc, text="Deko-Bilder (Logos/Icons) überspringen",
+                            variable=self._skipdeco_var).pack(anchor="w", padx=8, pady=(0, 8))
+            ctk.CTkLabel(sc, text="Erkennt Logo-/Icon-Container & Dateinamen – größenunabhängig.",
+                         text_color="gray55", font=ctk.CTkFont(size=11),
+                         anchor="w").pack(anchor="w", padx=30, pady=(0, 4))
+
             ctk.CTkFrame(sc, height=1, fg_color="gray35").pack(
                 fill="x", padx=8, pady=(18, 14))
 
@@ -2153,6 +2190,7 @@ if __name__ == "__main__":
             self._headless_var.set(s.get("headless", True))
             self._max_var.set(s.get("max_images", 30))
             self._mindesc_var.set(s.get("min_describe_px", 64))
+            self._skipdeco_var.set(s.get("skip_decorative_images", True))
             # Erscheinungsbild: intern "dark"/"light"/"system" → Label mit Emoji
             _mode_to_label = {"dark": "🌙  Dark", "light": "☀️  Light", "system": "🖥  System"}
             self._appear_var.set(_mode_to_label.get(s.get("appearance", "dark"), "🌙  Dark"))
@@ -2171,6 +2209,7 @@ if __name__ == "__main__":
                 s["min_describe_px"] = max(0, int(self._mindesc_var.get()))
             except (ValueError, tk.TclError):
                 s["min_describe_px"] = 64
+            s["skip_decorative_images"] = bool(self._skipdeco_var.get())
             # Erscheinungsbild: Label → interner Schlüssel
             _label_to_mode = {"🌙  Dark": "dark", "☀️  Light": "light", "🖥  System": "system"}
             appearance = _label_to_mode.get(self._appear_var.get(), "dark")
