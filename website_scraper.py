@@ -1182,31 +1182,51 @@ class Scraper:
         haystack = " ".join(el.get("class") or []) + " " + (el.get("id") or "")
         return bool(self._NAVISH_RE.search(haystack))
 
+    # Anker für ID-basierte Haupt-Container (ganze ID = einer dieser Begriffe,
+    # ggf. mit -content-Suffix): #content, #main, #main-content, #primary …
+    _CONTENT_ID_RE = re.compile(
+        r"^(content|main|primary|page)([-_]?content)?$", re.I
+    )
+
     def _find_content_root(self, soup):
         """Findet den Haupt-Inhaltscontainer und überspringt Navigations-Elemente.
 
-        Frühere Heuristik (\\b(content|main|article)\\b) matchte fälschlich
-        Navigations-IDs wie 'gh-g-navigation--main', weil Bindestriche als
-        Wortgrenzen zählen – die <nav> wurde als Wurzel gewählt und in _node
-        sofort verworfen → leere Ausgabe.
+        Reihenfolge: starke, eindeutige Container zuerst (semantische Tags,
+        <content>-Tag, role=main, eindeutige IDs). Erst danach Klassen-Token.
+        Wichtig: Ein Klassen-Treffer darf die Seite nicht zu eng beschneiden –
+        enthält er 0 Bilder, obwohl der Body welche hat, wird auf <body>
+        zurückgefallen (sonst gingen ganze Sektionen inkl. Hero verloren).
+        _node überspringt nav/footer ohnehin.
         """
-        for tag in ("main", "article"):
-            el = soup.find(tag)
-            if el is not None:
-                return el
-        # Pro Stufe alle nicht-navigationsartigen Treffer sammeln und den
-        # textreichsten wählen (robust gegen kleine Teaser-/Zähler-Container).
+        body = soup.body or soup
+
+        # 1) Starke, eindeutige Container.
+        strong = (
+            soup.find("main")
+            or soup.find(attrs={"role": "main"})
+            or soup.find("article")
+            or soup.find("content")          # eigenes Wrapper-Tag (z. B. GREYHOUND-Seiten)
+            or soup.find(id=self._CONTENT_ID_RE)
+        )
+        if strong is not None and not self._is_navish(strong):
+            return strong
+
+        # 2) Klassen-Token gestaffelt; je Stufe den Treffer mit den meisten
+        #    Bildern wählen (Tie-Break: meiste Textlänge) – nicht ein Text-Leaf.
+        body_imgs = len(body.find_all("img"))
         for pattern in self._CONTENT_TIERS:
-            matches = []
-            seen = set()
-            for el in soup.find_all(class_=pattern) + soup.find_all(id=pattern):
-                if id(el) in seen or self._is_navish(el):
-                    continue
-                seen.add(id(el))
-                matches.append(el)
-            if matches:
-                return max(matches, key=lambda e: len(e.get_text(strip=True)))
-        return soup.body or soup
+            matches = [el for el in soup.find_all(class_=pattern)
+                       if not self._is_navish(el)]
+            if not matches:
+                continue
+            best = max(matches, key=lambda e: (len(e.find_all("img")),
+                                               len(e.get_text(strip=True))))
+            # Sicherheitsnetz gegen Über-Einengung: verliert der Treffer alle
+            # Bilder, obwohl die Seite welche hat → lieber den ganzen Body.
+            if body_imgs and not best.find_all("img"):
+                return body
+            return best
+        return body
 
     def _to_markdown(self, html: str, img_data: dict) -> str:
         try:
