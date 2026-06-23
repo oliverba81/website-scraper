@@ -12,12 +12,15 @@ import re
 import json
 import gzip
 import base64
+import email
+import html as _html
 import random
 import threading
 import subprocess
 import importlib
 import time
 import tkinter as tk
+from email import policy
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -233,23 +236,29 @@ def save_settings(data: dict):
 
 # ─── Sitemap-Queue (wiederaufnehmbare Abarbeitung) ────────────────────────────
 
-QUEUE_FILENAME = "_queue.json"
-QUEUE_SCHEMA   = 1
+QUEUE_FILENAME     = "_queue.json"
+# Eigene Datei für den EML-Ordner-Modus: anderer Lebenszyklus als die Sitemap-
+# Queue (wird NICHT bei Abschluss gelöscht, sondern dient dauerhaft dem
+# inkrementellen „welche Dateien sind erledigt“). Getrennte Namen verhindern,
+# dass ein abgeschlossener Lauf des einen Modus die Liste des anderen stört.
+EML_QUEUE_FILENAME = "_eml_queue.json"
+QUEUE_SCHEMA       = 1
 
 
-def _queue_path(output_dir) -> Path:
-    return Path(output_dir) / QUEUE_FILENAME
+def _queue_path(output_dir, filename: str = QUEUE_FILENAME) -> Path:
+    return Path(output_dir) / filename
 
 
-def _load_queue(output_dir, log_fn=None) -> dict:
-    """Lädt _queue.json. Gibt None zurück bei Fehler/falschem Schema.
+def _load_queue(output_dir, log_fn=None, filename: str = QUEUE_FILENAME) -> dict:
+    """Lädt die Queue-/Ledger-Datei. Gibt None zurück bei Fehler/falschem Schema.
 
     all_urls wird order-preserving dedupliziert, done auf all_urls geschnitten –
     so sind die Werte für Resume-Dialog und Worker identisch und robust gegen
-    geschrumpfte oder manuell editierte Queues.
+    geschrumpfte oder manuell editierte Listen. (Im EML-Modus tragen all_urls/done
+    Dateinamen statt URLs – die Logik ist identisch.)
     """
     try:
-        path = _queue_path(output_dir)
+        path = _queue_path(output_dir, filename)
         if not path.exists():
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -264,19 +273,20 @@ def _load_queue(output_dir, log_fn=None) -> dict:
         return data
     except Exception as exc:
         if log_fn:
-            log_fn(f"Queue konnte nicht gelesen werden ({exc}) – starte neu.")
+            log_fn(f"Liste konnte nicht gelesen werden ({exc}) – starte neu.")
         return None
 
 
-def _write_queue_atomic(output_dir, data: dict, log_fn=None):
-    """Schreibt _queue.json atomar (temp + os.replace). Nicht-fatal:
+def _write_queue_atomic(output_dir, data: dict, log_fn=None,
+                        filename: str = QUEUE_FILENAME):
+    """Schreibt die Queue-/Ledger-Datei atomar (temp + os.replace). Nicht-fatal:
 
     Ein OneDrive-Lock / PermissionError / Disk-voll bricht den Lauf NICHT ab –
     die Seite ist bereits erfolgreich geschrieben; im schlimmsten Fall wird sie
     bei einer Wiederaufnahme erneut verarbeitet.
     """
-    target = _queue_path(output_dir)
-    tmp    = target.with_suffix(target.suffix + ".tmp")   # _queue.json.tmp, selbes Verzeichnis
+    target = _queue_path(output_dir, filename)
+    tmp    = target.with_suffix(target.suffix + ".tmp")   # *.json.tmp, selbes Verzeichnis
     for attempt in range(3):
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -290,13 +300,13 @@ def _write_queue_atomic(output_dir, data: dict, log_fn=None):
     except OSError:
         pass
     if log_fn:
-        log_fn("Queue-Stand konnte nicht gespeichert werden – "
-               "bei Wiederaufnahme werden ggf. einige Seiten erneut verarbeitet.")
+        log_fn("Listen-Stand konnte nicht gespeichert werden – "
+               "bei Wiederaufnahme werden ggf. einige Dateien erneut verarbeitet.")
 
 
-def _delete_queue(output_dir):
-    """Entfernt _queue.json und eine evtl. übrig gebliebene _queue.json.tmp."""
-    target = _queue_path(output_dir)
+def _delete_queue(output_dir, filename: str = QUEUE_FILENAME):
+    """Entfernt die Queue-/Ledger-Datei und eine evtl. übrig gebliebene *.tmp."""
+    target = _queue_path(output_dir, filename)
     for p in (target, target.with_suffix(target.suffix + ".tmp")):
         try:
             p.unlink(missing_ok=True)
@@ -535,6 +545,68 @@ def _url_to_filename(url: str, ext: str = ".md") -> str:
     return name + ext
 
 
+def _eml_to_filename(path, ext: str = ".md") -> str:
+    """Erstellt einen sicheren Ausgabe-Dateinamen aus einem .eml-Pfad.
+
+    Auf oberster Verzeichnisebene sind .eml-Basisnamen eindeutig, daher genügt
+    der (gesäuberte) Dateistamm.
+    """
+    name = re.sub(r"[^\w\-]", "_", Path(path).stem)
+    name = re.sub(r"_+", "_", name).strip("_")[:100] or "eml"
+    return name + ext
+
+
+# ─── .eml-Parser ──────────────────────────────────────────────────────────────
+
+def _parse_eml(path, max_images: int = None):
+    """Parst eine .eml-Datei und liefert (html, img_data, subject, date, from_).
+
+    - Wählt den HTML-Body (Fallback: text/plain in <pre> verpackt).
+    - Sammelt inline-Bilder (Content-ID) als img_data{ "cid:<id>" / "<id>": (b64, mime) },
+      genau so wie das HTML sie via src="cid:…" referenziert → der bestehende
+      _img_block-Lookup (Stufe 1) trifft direkt.
+    - Respektiert max_images (begrenzt die Anzahl beschriebener Bilder).
+    """
+    with open(path, "rb") as fh:
+        msg = email.message_from_binary_file(fh, policy=policy.default)
+
+    subject = (msg["subject"] or Path(path).stem).strip()
+    date    = (msg["date"] or "").strip()
+    from_   = (msg["from"] or "").strip()
+
+    body = msg.get_body(preferencelist=("html", "plain"))
+    if body is not None and body.get_content_type() == "text/html":
+        html = body.get_content()
+    elif body is not None:
+        text = body.get_content()
+        html = ("<html><head></head><body><pre>"
+                + _html.escape(text) + "</pre></body></html>")
+    else:
+        html = "<html><head></head><body></body></html>"
+
+    img_data: dict = {}
+    count = 0
+    for part in msg.walk():
+        if part.get_content_type() not in SUPPORTED_MIMES:
+            continue
+        if max_images is not None and count >= max_images:
+            break
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            payload = None
+        if not payload:
+            continue
+        cid  = (part["Content-ID"] or "").strip().strip("<>")
+        b64  = base64.b64encode(payload).decode()
+        mime = part.get_content_type()
+        if cid:
+            img_data[f"cid:{cid}"] = (b64, mime)
+            img_data[cid]          = (b64, mime)
+            count += 1
+    return html, img_data, subject, date, from_
+
+
 # ─── Simulationsmodus ────────────────────────────────────────────────────────
 
 def _sim_html(url: str) -> str:
@@ -671,6 +743,9 @@ class Scraper:
         self._img_pos_map: dict = {}
         self._img_counter = [0]
         self._img_total = [0]
+        # Zusätzliche Format-Variablen, die _extract_page_vars überschreiben
+        # (für .eml: date/from). Beim Web-Pfad leer → keine Auswirkung.
+        self._meta: dict = {}
 
     def run(self, url: str, output_path: str, output_format: dict = None):
         self.base_url = url
@@ -682,6 +757,63 @@ class Scraper:
             return
 
         self._progress(42)
+        self._convert_and_write(html, img_data, output_path, output_format)
+
+    def run_eml(self, eml_path: str, output_path: str, output_format: dict = None):
+        """Wandelt eine einzelne .eml-Datei um (ohne Browser).
+
+        Erzeugt aus der Mail dasselbe (html, img_data)-Paar wie der Browser-Pfad
+        und nutzt danach dieselbe Konvertierung/Render-Logik.
+        """
+        self.base_url = eml_path
+        self._log(f"Lese E-Mail: {Path(eml_path).name}")
+        self._progress(10)
+
+        # describe_images respektieren (wie der Browser-Pfad): ist die
+        # Beschreibung aus, werden keine Bilder eingesammelt (max_images=0 →
+        # img_data leer) und _img_block zeigt den Alt-/Quelle-Fallback.
+        describe = self.settings.get("describe_images", True)
+        max_imgs = int(self.settings.get("max_images", 30)) if describe else 0
+        html, img_data, subject, date, from_ = _parse_eml(eml_path, max_imgs)
+
+        # Betreff als einzige Titelquelle: <title> einsetzen, falls keiner da ist.
+        # _to_markdown nutzt ihn für die # H1, _extract_page_vars für das title-Feld.
+        if subject:
+            from bs4 import BeautifulSoup
+            if BeautifulSoup(html, "lxml").find("title") is None:
+                title_tag = f"<title>{_html.escape(subject)}</title>"
+                if re.search(r"(?i)<head[^>]*>", html):
+                    html = re.sub(r"(?i)(<head[^>]*>)", r"\1" + title_tag, html, count=1)
+                else:
+                    html = title_tag + html
+
+        # Layout-Icons (z. B. 24×24) nicht an die AI schicken: <img> mit gesetzten
+        # width/height < 30 vor der Konvertierung entfernen. (Greift nur bei
+        # vorhandenen Attributen – attributlose Kleinbilder bleiben erhalten.)
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+        removed = False
+        for img in soup.find_all("img"):
+            try:
+                w = int(img.get("width", "0") or 0)
+                h = int(img.get("height", "0") or 0)
+            except ValueError:
+                continue
+            if 0 < w < 30 and 0 < h < 30:
+                img.decompose()
+                removed = True
+        if removed:
+            html = str(soup)
+
+        # url kommt aus base_url; title aus <title>. Nur date/from ergänzen.
+        self._meta = {"date": date, "meta_description": from_}
+
+        self._progress(42)
+        self._convert_and_write(html, img_data, output_path, output_format)
+
+    def _convert_and_write(self, html: str, img_data: dict,
+                           output_path: str, output_format: dict = None):
+        """Geteilter Render-/Schreib-Tail von run() und run_eml()."""
         fmt      = output_format or {"type": "markdown", "extension": ".md"}
         fmt_type = fmt.get("type", "markdown")
         _label   = {"xml": "XML", "csv": "CSV"}.get(fmt_type, "Markdown")
@@ -730,7 +862,7 @@ class Scraper:
         meta_desc = meta_tag.get("content", "").strip() if meta_tag else ""
         body       = soup.body or soup
         plain_text = body.get_text(separator=" ", strip=True)
-        return {
+        result = {
             "title":            title,
             "url":              self.base_url,
             "content":          md,
@@ -739,6 +871,9 @@ class Scraper:
             "date":             time.strftime("%d.%m.%Y"),
             "images_count":     str(len(self._img_data)),
         }
+        # .eml-Metadaten (date/from) überschreiben die Defaults; Web-Pfad: _meta leer.
+        result.update({k: v for k, v in self._meta.items() if v})
+        return result
 
     def _render_xml(self, md: str, html: str, fmt: dict) -> str:
         """Rendert die Seite als wohlgeformtes XML gemäß Format-Template.
@@ -2316,6 +2451,9 @@ if __name__ == "__main__":
                                command=self._mode_changed).pack(side="left", padx=(0, 20))
             ctk.CTkRadioButton(mode_row, text="Sitemap  (alle Seiten)",
                                variable=self._mode_var, value="sitemap",
+                               command=self._mode_changed).pack(side="left", padx=(0, 20))
+            ctk.CTkRadioButton(mode_row, text="EML-Ordner",
+                               variable=self._mode_var, value="eml",
                                command=self._mode_changed).pack(side="left")
             self._sim_var = tk.BooleanVar(value=False)
             ctk.CTkCheckBox(mode_row, text="🧪  Simulationsmodus",
@@ -2338,14 +2476,23 @@ if __name__ == "__main__":
             self._sim_banner_row = r
             r += 1
 
-            # URL
-            ctk.CTkLabel(cnt, text="URL", font=ctk.CTkFont(weight="bold"),
-                         anchor="w").grid(row=r, column=0, sticky="w", pady=6)
+            # URL / EML-Ordner
+            self._url_label = ctk.CTkLabel(cnt, text="URL",
+                                           font=ctk.CTkFont(weight="bold"), anchor="w")
+            self._url_label.grid(row=r, column=0, sticky="w", pady=6)
             self._url_var = tk.StringVar()
-            ctk.CTkEntry(
+            self._url_entry = ctk.CTkEntry(
                 cnt, textvariable=self._url_var, height=36,
                 placeholder_text="https://example.com/page  oder  https://example.com/sitemap.xml",
-            ).grid(row=r, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=6)
+            )
+            # Entry in Spalte 1 (weight=1, dehnt sich). Spalte 2 bleibt leer und
+            # damit 0px breit, solange der Quell-Picker nicht eingeblendet ist –
+            # kein columnspan-Wechsel zur Laufzeit nötig (vermeidet Flackern).
+            self._url_entry.grid(row=r, column=1, sticky="ew", padx=(10, 6), pady=6)
+            # Ordner-Picker für die Quelle – nur im EML-Modus eingeblendet.
+            self._url_browse_btn = ctk.CTkButton(cnt, text="…", width=36, height=36,
+                                                 command=self._browse_source)
+            self._url_row = r
             r += 1
 
             # Ausgabe
@@ -2503,7 +2650,8 @@ if __name__ == "__main__":
 
         def _mode_changed(self):
             mode = self._mode_var.get()
-            if mode == "sitemap":
+            prev = getattr(self, "_prev_mode", "single")
+            if mode in ("sitemap", "eml"):
                 self._out_label.configure(text="Ausgabeordner")
                 self._open_btn.configure(text="📁  Öffnen")
                 self._sep.grid()
@@ -2517,14 +2665,35 @@ if __name__ == "__main__":
                 self._sitemap_sub.grid_remove()
                 self._queue_btn.pack_forget()
                 self._discard_btn.pack_forget()
-            # Zuletzt genutzten Pfad pro Modus wiederherstellen (statt leeren),
-            # damit eine Wiederaufnahme im selben Ordner zuverlässig greift.
+
+            # Eingabe-Zeile: EML-Modus = Quellordner mit Picker, sonst URL.
+            if mode == "eml":
+                self._url_label.configure(text="EML-Ordner")
+                self._url_entry.configure(placeholder_text="Ordner mit .eml-Dateien")
+                self._url_browse_btn.grid(row=self._url_row, column=2, sticky="w")
+            else:
+                self._url_label.configure(text="URL")
+                self._url_entry.configure(
+                    placeholder_text="https://example.com/page  oder  https://example.com/sitemap.xml")
+                self._url_browse_btn.grid_remove()
+
+            # Eingabewert nur beim Wechsel über die Web↔EML-Grenze tauschen
+            # (single↔sitemap teilen sich die Web-URL und bleiben unverändert).
+            if mode == "eml" and prev != "eml":
+                self._url_web_cache = self._url_var.get()
+                self._url_var.set(load_settings().get("last_source_eml", ""))
+            elif mode != "eml" and prev == "eml":
+                self._url_var.set(getattr(self, "_url_web_cache",
+                                          load_settings().get("last_url", "")))
+            self._prev_mode = mode
+
+            # Zuletzt genutzten Ausgabepfad pro Modus wiederherstellen.
             self._out_var.set(load_settings().get(f"last_output_{mode}", ""))
 
         # ── UI-Helfer ─────────────────────────────────────────────────────────
 
         def _browse_output(self):
-            if self._mode_var.get() == "sitemap":
+            if self._mode_var.get() in ("sitemap", "eml"):
                 f = filedialog.askdirectory(title="Ausgabeordner wählen")
             else:
                 fmt  = get_active_format()
@@ -2537,6 +2706,12 @@ if __name__ == "__main__":
                 )
             if f:
                 self._out_var.set(f)
+
+        def _browse_source(self):
+            """Quellordner mit .eml-Dateien wählen (nur EML-Modus)."""
+            f = filedialog.askdirectory(title="Ordner mit .eml-Dateien wählen")
+            if f:
+                self._url_var.set(f)
 
         def _open_file(self):
             p = self._out_var.get()
@@ -2557,12 +2732,16 @@ if __name__ == "__main__":
             except OSError:
                 subprocess.Popen(["explorer", "/select,", path])
 
+        def _queue_filename(self) -> str:
+            """Listen-Dateiname je nach Modus (EML hat ein eigenes, dauerhaftes)."""
+            return EML_QUEUE_FILENAME if self._mode_var.get() == "eml" else QUEUE_FILENAME
+
         def _open_queue(self):
             out = self._out_var.get().strip()
             if not out:
                 _showmsg(self, "Hinweis", "Kein Ausgabeordner angegeben.")
                 return
-            qp = _queue_path(out)
+            qp = _queue_path(out, self._queue_filename())
             if not qp.exists():
                 _showmsg(self, "Hinweis", "Keine offene Liste vorhanden.")
                 return
@@ -2577,7 +2756,7 @@ if __name__ == "__main__":
             if not out:
                 _showmsg(self, "Hinweis", "Kein Ausgabeordner angegeben.")
                 return
-            qp = _queue_path(out)
+            qp = _queue_path(out, self._queue_filename())
             if not qp.exists():
                 _showmsg(self, "Hinweis", "Keine offene Liste vorhanden.")
                 return
@@ -2585,9 +2764,9 @@ if __name__ == "__main__":
                 self, "Lauf verwerfen",
                 "Den gespeicherten Wiederaufnahme-Stand für diesen Ordner verwerfen?\n\n"
                 "Bereits erzeugte Dateien bleiben erhalten – nur die Restliste "
-                "(_queue.json) wird gelöscht.",
+                "wird gelöscht.",
             ):
-                _delete_queue(out)
+                _delete_queue(out, self._queue_filename())
                 self._log_ui("Wiederaufnahme-Stand verworfen.")
                 _showmsg(self, "Verworfen", "Die offene Liste wurde gelöscht.")
 
@@ -2677,9 +2856,15 @@ if __name__ == "__main__":
 
         def _save_session(self):
             s = load_settings()
-            s["last_url"] = self._url_var.get()
-            s["last_mode"] = self._mode_var.get()
-            s[f"last_output_{self._mode_var.get()}"] = self._out_var.get()
+            mode = self._mode_var.get()
+            s["last_mode"] = mode
+            s[f"last_output_{mode}"] = self._out_var.get()
+            if mode == "eml":
+                # Quellordner separat – die Web-URL (last_url) nicht mit einem
+                # Dateipfad überschreiben.
+                s["last_source_eml"] = self._url_var.get()
+            else:
+                s["last_url"] = self._url_var.get()
             save_settings(s)
 
         # ── Logging / Fortschritt (thread-sicher) ─────────────────────────────
@@ -2700,10 +2885,11 @@ if __name__ == "__main__":
 
         # ── Sitemap-Fortschritt (thread-sicher) ───────────────────────────────
 
-        def _update_sitemap_progress(self, done: int, total: int, page_times: list):
+        def _update_sitemap_progress(self, done: int, total: int, page_times: list,
+                                     unit: str = "Seite"):
             pct = done / max(total, 1)
             self._sitemap_bar.set(pct)
-            self._pages_var.set(f"Seite {done} von {total}   ({pct * 100:.0f} %)")
+            self._pages_var.set(f"{unit} {done} von {total}   ({pct * 100:.0f} %)")
             if page_times:
                 avg = sum(page_times) / len(page_times)
                 remaining_secs = (total - done) * avg
@@ -2716,7 +2902,7 @@ if __name__ == "__main__":
                 else:
                     eta_txt = f"Noch ca. {s} sek"
                 self._eta_var.set(eta_txt)
-                self._avg_var.set(f"  ·  Ø {avg:.0f} Sek / Seite")
+                self._avg_var.set(f"  ·  Ø {avg:.0f} Sek / {unit}")
             else:
                 self._eta_var.set("Berechne geschätzte Restzeit…")
                 self._avg_var.set("")
@@ -2727,15 +2913,19 @@ if __name__ == "__main__":
             if self._running:
                 return
             url = self._url_var.get().strip()
+            mode = self._mode_var.get()
             if not url:
-                _showmsg(self, "Hinweis", "Bitte URL eingeben.")
+                _showmsg(self, "Hinweis",
+                         "Bitte einen Ordner mit .eml-Dateien wählen." if mode == "eml"
+                         else "Bitte URL eingeben.")
                 return
-            if not url.startswith("http"):
+            # Web-Modi: fehlendes Schema ergänzen. EML-Modus: url ist ein
+            # Ordnerpfad → NICHT mit https:// präfixen.
+            if mode != "eml" and not url.startswith("http"):
                 url = "https://" + url
                 self._url_var.set(url)
 
             output = self._out_var.get().strip()
-            mode = self._mode_var.get()
             settings = load_settings()
             settings["simulate"] = self._sim_var.get()
             describe = settings.get("describe_images", True)
@@ -2751,7 +2941,23 @@ if __name__ == "__main__":
                     return
 
             resume = False
-            if mode == "sitemap":
+            if mode == "eml":
+                if not Path(url).is_dir():
+                    _showmsg(self, "Fehler",
+                             "Der angegebene Quellordner existiert nicht:\n" + url)
+                    return
+                if not output:
+                    stem = re.sub(r"[^\w\-]", "_", Path(url).name) or "eml"
+                    output = str(Path.home() / "Documents" / f"{stem}_eml")
+                    self._out_var.set(output)
+                try:
+                    Path(output).mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    _showmsg(self, "Fehler",
+                             f"Ausgabeordner konnte nicht angelegt werden:\n{exc}")
+                    return
+                # Kein Resume-Dialog: das dauerhafte Ledger setzt inkrementell fort.
+            elif mode == "sitemap":
                 if not output:
                     parsed = urlparse(url)
                     stem = re.sub(r"[^\w\-]", "_", parsed.netloc)
@@ -2808,6 +3014,13 @@ if __name__ == "__main__":
                 self._sitemap_bar.set(0)
                 threading.Thread(target=self._worker_sitemap,
                                  args=(url, output, settings, resume), daemon=True).start()
+            elif mode == "eml":
+                self._pages_var.set("Lese Ordner…")
+                self._eta_var.set("")
+                self._avg_var.set("")
+                self._sitemap_bar.set(0)
+                threading.Thread(target=self._worker_eml,
+                                 args=(url, output, settings), daemon=True).start()
             else:
                 threading.Thread(target=self._worker,
                                  args=(url, output, settings), daemon=True).start()
@@ -2985,6 +3198,96 @@ if __name__ == "__main__":
             except Exception as exc:
                 self._log(f"Index-Fehler: {exc}")
 
+        # ── Worker: EML-Ordner ────────────────────────────────────────────────
+
+        def _worker_eml(self, source_dir: str, output_dir: str, settings: dict):
+            try:
+                out_path = Path(output_dir)
+                fmt      = get_active_format()
+                fmt_ext  = fmt.get("extension", ".md")
+
+                self._log(f"Verarbeite EML-Ordner: {source_dir}")
+                files = sorted(Path(source_dir).glob("*.eml"))
+                names = [f.name for f in files]
+                total = len(names)
+                if total == 0:
+                    self.after(0, self._on_error,
+                               "Keine .eml-Dateien im gewählten Ordner gefunden.")
+                    return
+
+                # Dauerhaftes Ledger laden (nur bei passendem Ordner + Format).
+                q = _load_queue(output_dir, self._log, filename=EML_QUEUE_FILENAME)
+                done = set()
+                if q and q.get("source_dir") == source_dir and q.get("format_ext") == fmt_ext:
+                    done = set(q["done"]) & set(names)
+                # Ergänzung: bereits vorhandene Ausgabedateien gelten als erledigt
+                # (robust, falls das Ledger verloren ging/gelöscht wurde).
+                for f in files:
+                    if (out_path / _eml_to_filename(f, fmt_ext)).exists():
+                        done.add(f.name)
+                initial_done = len(done)
+
+                def _save_state():
+                    _write_queue_atomic(output_dir, {
+                        "schema_version": QUEUE_SCHEMA,
+                        "source_dir": source_dir,
+                        "format_ext": fmt_ext,
+                        "created": (q or {}).get("created", time.strftime("%Y-%m-%d %H:%M")),
+                        "updated": time.strftime("%Y-%m-%d %H:%M"),
+                        # all_urls/done tragen hier Dateinamen (siehe _load_queue-Doku).
+                        "all_urls": names,
+                        "done": [n for n in names if n in done],
+                    }, self._log, filename=EML_QUEUE_FILENAME)
+
+                _save_state()
+                self._log(f"{total} .eml gefunden"
+                          + (f" · {initial_done} bereits erledigt" if initial_done else ""))
+
+                page_times: list = []
+                self.after(0, self._update_sitemap_progress,
+                           len(done), total, page_times, "Datei")
+
+                for i, f in enumerate(files):
+                    if self._stop_event.is_set():
+                        break
+                    if f.name in done:
+                        continue
+                    self._log(f"\n[{i + 1}/{total}] {f.name}")
+                    self._set_progress(0)
+                    file_path = str(out_path / _eml_to_filename(f, fmt_ext))
+                    t0 = time.time()
+                    try:
+                        scraper = Scraper(settings=settings, log_fn=self._log,
+                                          progress_fn=self._set_progress,
+                                          stop_event=self._stop_event)
+                        scraper.run_eml(str(f), file_path, output_format=fmt)
+                    except Exception as exc:
+                        self._log(f"  FEHLER: {exc}")
+                        continue   # bleibt pending → Retry beim nächsten Lauf
+                    if self._stop_event.is_set():
+                        break
+                    done.add(f.name)
+                    page_times.append(time.time() - t0)
+                    self.after(0, self._update_sitemap_progress,
+                               len(done), total, page_times, "Datei")
+                    _save_state()
+
+                self.after(0, self._update_sitemap_progress,
+                           len(done), total, page_times, "Datei")
+                if not self._stop_event.is_set():
+                    failed = [n for n in names if n not in done]
+                    md_paths = [str(out_path / _eml_to_filename(f, fmt_ext))
+                                for f in files if f.name in done]
+                    _save_state()   # finalen Stand sichern – Ledger NICHT löschen (dauerhaft)
+                    self.after(0, self._done_eml, output_dir, total, initial_done,
+                               failed, page_times, md_paths)
+                else:
+                    self.after(0, self._cancelled)   # Ledger bleibt → Wiederaufnahme
+            except Exception as exc:
+                import traceback
+                self._log(f"FEHLER: {exc}\n{traceback.format_exc()}")
+                self.after(0, self._on_error, str(exc))
+
         # ── Fertig-Handler ────────────────────────────────────────────────────
 
         def _done(self, output: str):
@@ -3040,6 +3343,41 @@ if __name__ == "__main__":
                 f"\n⚡  Zeitersparnis: ~{_fmt_min(saved_min)} ({pct} %)\n"
                 f"   Manuell: ~{_fmt_min(human_min)}  ·  Tool: {_fmt_min(tool_min_total)}\n"
                 f"\n📁  {output_dir}"
+            )
+            if _askyn(self, "Fertig!", summary + "\n\nOrdner öffnen?"):
+                self._open_or_reveal(output_dir)
+
+        def _done_eml(self, output_dir: str, total: int, skipped: int,
+                      failed_names: list, page_times: list, md_paths: list):
+            self._running = False
+            self._start_btn.configure(state="normal")
+            self._stop_btn.configure(state="disabled")
+            self._prog_bar.set(1.0)
+            self._sitemap_bar.set(1.0)
+            failed = len(failed_names)
+            new = max(0, total - skipped - failed)
+            avg = sum(page_times) / len(page_times) if page_times else 0
+            tool_min_total = sum(page_times) / 60 if page_times else 0
+            human_min, _, _ = _estimate_human_time(md_paths)
+            tool_secs = sum(page_times)
+            saved_min = max(0.0, human_min - tool_min_total)
+            pct = int(saved_min / max(human_min, 0.01) * 100)
+            self._pages_var.set(f"Datei {total - failed} von {total}")
+            self._eta_var.set(
+                f"Fertig!  {new} neu · {skipped} übersprungen"
+                + (f" · {failed} fehlgeschlagen" if failed else ""))
+            self._avg_var.set(f"  ·  Ø {avg:.0f} Sek / Datei" if page_times else "")
+            if page_times:
+                self._show_savings(human_min, tool_secs)
+            _save_run(getattr(self, "_last_url", ""), "eml", new,
+                      tool_min_total, human_min)
+            summary = (
+                f"EML-Umwandlung abgeschlossen!\n\n"
+                f"✅  {new} neu umgewandelt\n"
+                f"⏭  {skipped} bereits erledigt (übersprungen)\n"
+                + (f"❌  {failed} fehlgeschlagen – werden beim nächsten Lauf "
+                   f"erneut versucht\n" if failed else "")
+                + f"\n📁  {output_dir}"
             )
             if _askyn(self, "Fertig!", summary + "\n\nOrdner öffnen?"):
                 self._open_or_reveal(output_dir)
