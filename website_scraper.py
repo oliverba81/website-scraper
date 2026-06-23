@@ -29,7 +29,7 @@ from xml.etree import ElementTree as ET
 # ─── Konstanten ──────────────────────────────────────────────────────────────
 
 APP_NAME    = "website_scraper"
-APP_VERSION = "1.0.18"
+APP_VERSION = "1.0.19"
 SETTINGS_FILE = Path.home() / f".{APP_NAME}_settings.json"
 
 GITHUB_REPO     = "oliverba81/website-scraper"
@@ -766,6 +766,26 @@ class Scraper:
         und nutzt danach dieselbe Konvertierung/Render-Logik.
         """
         self.base_url = eml_path
+
+        # ── Simulationsmodus ──────────────────────────────────────────────────
+        # Wie der Browser-Pfad (_browse): kein echtes Parsen, keine AI-Calls –
+        # nur Dummy-Inhalt mit kurzer simulierter Verarbeitungszeit.
+        if self.settings.get("simulate"):
+            self._log(f"  [SIM] Simuliere E-Mail-Verarbeitung: {Path(eml_path).name}")
+            delay = random.uniform(0.5, 1.5)
+            steps = 8
+            for i in range(steps):
+                if self._stop.is_set():
+                    return
+                time.sleep(delay / steps)
+                self._progress(10 + int(30 * (i + 1) / steps))
+            self._meta = {}
+            self._progress(42)
+            self._convert_and_write(_sim_html(Path(eml_path).name), {},
+                                    output_path, output_format)
+            return
+        # ──────────────────────────────────────────────────────────────────────
+
         self._log(f"Lese E-Mail: {Path(eml_path).name}")
         self._progress(10)
 
