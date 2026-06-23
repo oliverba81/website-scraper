@@ -1031,10 +1031,25 @@ class Scraper:
                                 alt: img.alt || '',
                                 width: w,
                                 height: h,
+                                dispW: img.offsetWidth,
+                                dispH: img.offsetHeight,
                                 complete: img.complete
                             };
                         });
                     }""")
+
+                    # Mindestgröße fürs Beschreiben: kleine Deko-Icons (Glyphen,
+                    # Häkchen, Badges) überspringen. Entscheidend ist die GERENDERTE
+                    # Größe (offsetWidth/Height) – ein groß angelegtes, aber per CSS
+                    # auf Icon-Maß verkleinertes SVG ist trotzdem Deko. Wenn die
+                    # Anzeigegröße (noch) 0 ist, dient die natürliche Größe als Ersatz.
+                    min_describe = int(self.settings.get("min_describe_px", 64))
+
+                    def _describe_size(info):
+                        dw, dh = info.get("dispW", 0), info.get("dispH", 0)
+                        if dw > 0 and dh > 0:
+                            return max(dw, dh)
+                        return max(info["width"], info["height"])
 
                     # SVGs werden NICHT mehr ausgeschlossen – sie können nicht direkt
                     # an die Vision-API gehen, werden aber in _download_image per
@@ -1044,6 +1059,7 @@ class Scraper:
                         if info["src"]
                         and info["width"] >= 30
                         and info["height"] >= 30
+                        and _describe_size(info) >= min_describe
                     ][:max_imgs]
 
                     total = len(candidates)
@@ -2071,6 +2087,16 @@ if __name__ == "__main__":
                          text_color="gray55",
                          font=ctk.CTkFont(size=11)).pack(side="left")
 
+            mindesc_row = ctk.CTkFrame(sc, fg_color="transparent")
+            mindesc_row.pack(anchor="w", padx=8, pady=(0, 8))
+            ctk.CTkLabel(mindesc_row, text="Bilder erst ab Größe beschreiben:").pack(side="left")
+            self._mindesc_var = tk.IntVar(value=64)
+            ctk.CTkEntry(mindesc_row, textvariable=self._mindesc_var, width=72).pack(
+                side="left", padx=(10, 8))
+            ctk.CTkLabel(mindesc_row, text="px (überspringt kleine Deko-Icons; 0 = alle)",
+                         text_color="gray55",
+                         font=ctk.CTkFont(size=11)).pack(side="left")
+
             ctk.CTkFrame(sc, height=1, fg_color="gray35").pack(
                 fill="x", padx=8, pady=(18, 14))
 
@@ -2106,6 +2132,7 @@ if __name__ == "__main__":
             self._desc_var.set(s.get("describe_images", True))
             self._headless_var.set(s.get("headless", True))
             self._max_var.set(s.get("max_images", 30))
+            self._mindesc_var.set(s.get("min_describe_px", 64))
             # Erscheinungsbild: intern "dark"/"light"/"system" → Label mit Emoji
             _mode_to_label = {"dark": "🌙  Dark", "light": "☀️  Light", "system": "🖥  System"}
             self._appear_var.set(_mode_to_label.get(s.get("appearance", "dark"), "🌙  Dark"))
@@ -2120,6 +2147,10 @@ if __name__ == "__main__":
                 s["max_images"] = int(self._max_var.get())
             except (ValueError, tk.TclError):
                 s["max_images"] = 30
+            try:
+                s["min_describe_px"] = max(0, int(self._mindesc_var.get()))
+            except (ValueError, tk.TclError):
+                s["min_describe_px"] = 64
             # Erscheinungsbild: Label → interner Schlüssel
             _label_to_mode = {"🌙  Dark": "dark", "☀️  Light": "light", "🖥  System": "system"}
             appearance = _label_to_mode.get(self._appear_var.get(), "dark")
