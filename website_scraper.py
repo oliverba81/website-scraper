@@ -745,6 +745,10 @@ class Scraper:
         self._img_pos_map: dict = {}
         self._img_counter = [0]
         self._img_total = [0]
+        # Menge der data-scraper-idx, die tatsächlich beschrieben werden sollen
+        # (Kandidaten nach Größen-/Deko-Filter). None = kein Filter aktiv
+        # (z. B. .eml-Modus) → alle <img> wie bisher behandeln.
+        self._describe_idx = None
         # Zusätzliche Format-Variablen, die _extract_page_vars überschreiben
         # (für .eml: date/from). Beim Web-Pfad leer → keine Auswirkung.
         self._meta: dict = {}
@@ -1076,6 +1080,11 @@ class Scraper:
                         if len(candidates) >= max_imgs:
                             break
 
+                    # Nur diese Bilder sollen in der Ausgabe erscheinen; alle
+                    # anderen <img> werden in _img_block komplett übersprungen
+                    # (kein Platzhalter-Block für weg­gefilterte Bilder).
+                    self._describe_idx = {info["idx"] for info in candidates}
+
                     total = len(candidates)
                     incomplete = sum(1 for i in img_infos if not i.get("complete", True) and i["src"])
                     skip_info = f" · {incomplete} noch nicht fertig geladen" if incomplete else ""
@@ -1284,7 +1293,16 @@ class Scraper:
 
         self._img_data = img_data
         self._img_counter = [0]
-        self._img_total = [len(list(root.find_all("img")))]
+        root_imgs = list(root.find_all("img"))
+        if self._describe_idx is not None:
+            # Nur die nicht-gefilterten Bilder zählen (für „Bild n/total").
+            self._img_total = [sum(
+                1 for im in root_imgs
+                if (im.get("data-scraper-idx") or "").isdigit()
+                and int(im["data-scraper-idx"]) in self._describe_idx
+            )]
+        else:
+            self._img_total = [len(root_imgs)]
 
         lines: list = []
         if page_title:
@@ -1501,6 +1519,15 @@ class Scraper:
     # ── Bild-Block ────────────────────────────────────────────────────────────
 
     def _img_block(self, el, out: list, caption: str = ""):
+        # Bewusst weg­gefilterte Bilder (zu klein / Deko) erzeugen GAR KEINEN
+        # Block – sonst stünde für jedes Logo/Icon ein leerer „Bild-URL"-
+        # Platzhalter in der Ausgabe. Greift nur im Browser-Pfad, wo
+        # _describe_idx gesetzt ist; .eml-Modus (None) behält das alte Verhalten.
+        if self._describe_idx is not None:
+            sidx = el.get("data-scraper-idx")
+            if sidx is not None and sidx.isdigit() and int(sidx) not in self._describe_idx:
+                return
+
         src = (
             el.get("src")
             or el.get("data-src")
