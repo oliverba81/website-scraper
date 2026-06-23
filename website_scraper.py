@@ -1031,18 +1031,35 @@ class Scraper:
                                 alt: img.alt || '',
                                 width: w,
                                 height: h,
+                                dispW: img.offsetWidth,
+                                dispH: img.offsetHeight,
                                 complete: img.complete
                             };
                         });
                     }""")
 
+                    # Mindestgröße fürs Beschreiben: kleine Deko-Icons (Glyphen,
+                    # Häkchen, Badges) überspringen. Entscheidend ist die GERENDERTE
+                    # Größe (offsetWidth/Height) – ein groß angelegtes, aber per CSS
+                    # auf Icon-Maß verkleinertes SVG ist trotzdem Deko. Wenn die
+                    # Anzeigegröße (noch) 0 ist, dient die natürliche Größe als Ersatz.
+                    min_describe = int(self.settings.get("min_describe_px", 64))
+
+                    def _describe_size(info):
+                        dw, dh = info.get("dispW", 0), info.get("dispH", 0)
+                        if dw > 0 and dh > 0:
+                            return max(dw, dh)
+                        return max(info["width"], info["height"])
+
+                    # SVGs werden NICHT mehr ausgeschlossen – sie können nicht direkt
+                    # an die Vision-API gehen, werden aber in _download_image per
+                    # Element-Screenshot zu PNG gerendert.
                     candidates = [
                         info for info in img_infos
                         if info["src"]
                         and info["width"] >= 30
                         and info["height"] >= 30
-                        and not info["src"].lower().endswith(".svg")
-                        and "image/svg" not in info["src"]
+                        and _describe_size(info) >= min_describe
                     ][:max_imgs]
 
                     total = len(candidates)
@@ -1053,7 +1070,7 @@ class Scraper:
                     for i, info in enumerate(candidates):
                         if self._stop.is_set():
                             break
-                        self._download_image(ctx, info, img_data)
+                        self._download_image(ctx, page, info, img_data)
                         self._progress(32 + int(10 * (i + 1) / max(total, 1)))
 
                 else:
@@ -1081,20 +1098,50 @@ class Scraper:
         page.evaluate("window.scrollTo(0, 0)")
         page.wait_for_timeout(300)
 
-    def _download_image(self, ctx, info: dict, img_data: dict):
+    def _screenshot_image(self, page, idx: int):
+        """Rendert ein <img>-Element (z. B. SVG) per Element-Screenshot zu PNG.
+
+        Gibt (b64, "image/png") zurück oder (None, None), wenn das Element
+        fehlt/unsichtbar ist.
+        """
+        if idx < 0:
+            return None, None
+        try:
+            el = page.query_selector(f'img[data-scraper-idx="{idx}"]')
+            if el is None:
+                return None, None
+            png = el.screenshot(timeout=5000)
+            return base64.b64encode(png).decode(), "image/png"
+        except Exception:
+            return None, None
+
+    def _download_image(self, ctx, page, info: dict, img_data: dict):
         abs_src = info["src"]
         orig_src = info["originalSrc"]
         idx = info.get("idx", -1)
+        # SVG kann die Vision-API nicht direkt verarbeiten → als PNG rendern.
+        is_svg = (abs_src.lower().split("?")[0].endswith(".svg")
+                  or "image/svg" in abs_src.lower())
         try:
-            response = ctx.request.get(abs_src)
-            if not response.ok:
-                self._log(f"  [Bild] HTTP {response.status}: {abs_src[:90]}")
-                return
-            ct = response.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-            if ct not in SUPPORTED_MIMES:
-                self._log(f"  [Bild] Übersprungen ({ct}): {abs_src[:90]}")
-                return
-            b64 = base64.b64encode(response.body()).decode()
+            if is_svg:
+                b64, ct = self._screenshot_image(page, idx)
+                if b64 is None:
+                    self._log(f"  [Bild] SVG nicht renderbar: {abs_src[:90]}")
+                    return
+            else:
+                response = ctx.request.get(abs_src)
+                if not response.ok:
+                    self._log(f"  [Bild] HTTP {response.status}: {abs_src[:90]}")
+                    return
+                ct = response.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                if ct not in SUPPORTED_MIMES:
+                    # Nicht direkt unterstützt (z. B. SVG/AVIF) → per Screenshot rendern.
+                    b64, ct = self._screenshot_image(page, idx)
+                    if b64 is None:
+                        self._log(f"  [Bild] Übersprungen ({ct}): {abs_src[:90]}")
+                        return
+                else:
+                    b64 = base64.b64encode(response.body()).decode()
             img_data[abs_src] = (b64, ct)
             # Auch relative Variante speichern (Pfad ohne Domain)
             try:
@@ -2040,6 +2087,16 @@ if __name__ == "__main__":
                          text_color="gray55",
                          font=ctk.CTkFont(size=11)).pack(side="left")
 
+            mindesc_row = ctk.CTkFrame(sc, fg_color="transparent")
+            mindesc_row.pack(anchor="w", padx=8, pady=(0, 8))
+            ctk.CTkLabel(mindesc_row, text="Bilder erst ab Größe beschreiben:").pack(side="left")
+            self._mindesc_var = tk.IntVar(value=64)
+            ctk.CTkEntry(mindesc_row, textvariable=self._mindesc_var, width=72).pack(
+                side="left", padx=(10, 8))
+            ctk.CTkLabel(mindesc_row, text="px (überspringt kleine Deko-Icons; 0 = alle)",
+                         text_color="gray55",
+                         font=ctk.CTkFont(size=11)).pack(side="left")
+
             ctk.CTkFrame(sc, height=1, fg_color="gray35").pack(
                 fill="x", padx=8, pady=(18, 14))
 
@@ -2075,6 +2132,7 @@ if __name__ == "__main__":
             self._desc_var.set(s.get("describe_images", True))
             self._headless_var.set(s.get("headless", True))
             self._max_var.set(s.get("max_images", 30))
+            self._mindesc_var.set(s.get("min_describe_px", 64))
             # Erscheinungsbild: intern "dark"/"light"/"system" → Label mit Emoji
             _mode_to_label = {"dark": "🌙  Dark", "light": "☀️  Light", "system": "🖥  System"}
             self._appear_var.set(_mode_to_label.get(s.get("appearance", "dark"), "🌙  Dark"))
@@ -2089,6 +2147,10 @@ if __name__ == "__main__":
                 s["max_images"] = int(self._max_var.get())
             except (ValueError, tk.TclError):
                 s["max_images"] = 30
+            try:
+                s["min_describe_px"] = max(0, int(self._mindesc_var.get()))
+            except (ValueError, tk.TclError):
+                s["min_describe_px"] = 64
             # Erscheinungsbild: Label → interner Schlüssel
             _label_to_mode = {"🌙  Dark": "dark", "☀️  Light": "light", "🖥  System": "system"}
             appearance = _label_to_mode.get(self._appear_var.get(), "dark")
