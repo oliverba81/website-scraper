@@ -31,7 +31,7 @@ from xml.etree import ElementTree as ET
 # ─── Konstanten ──────────────────────────────────────────────────────────────
 
 APP_NAME    = "website_scraper"
-APP_VERSION = "1.0.21"
+APP_VERSION = "1.0.23"
 SETTINGS_FILE = Path.home() / f".{APP_NAME}_settings.json"
 
 GITHUB_REPO     = "oliverba81/website-scraper"
@@ -745,6 +745,10 @@ class Scraper:
         self._img_pos_map: dict = {}
         self._img_counter = [0]
         self._img_total = [0]
+        # Menge der data-scraper-idx, die tatsächlich beschrieben werden sollen
+        # (Kandidaten nach Größen-/Deko-Filter). None = kein Filter aktiv
+        # (z. B. .eml-Modus) → alle <img> wie bisher behandeln.
+        self._describe_idx = None
         # Zusätzliche Format-Variablen, die _extract_page_vars überschreiben
         # (für .eml: date/from). Beim Web-Pfad leer → keine Auswirkung.
         self._meta: dict = {}
@@ -1076,6 +1080,11 @@ class Scraper:
                         if len(candidates) >= max_imgs:
                             break
 
+                    # Nur diese Bilder sollen in der Ausgabe erscheinen; alle
+                    # anderen <img> werden in _img_block komplett übersprungen
+                    # (kein Platzhalter-Block für weg­gefilterte Bilder).
+                    self._describe_idx = {info["idx"] for info in candidates}
+
                     total = len(candidates)
                     incomplete = sum(1 for i in img_infos if not i.get("complete", True) and i["src"])
                     skip_info = f" · {incomplete} noch nicht fertig geladen" if incomplete else ""
@@ -1212,31 +1221,51 @@ class Scraper:
         haystack = " ".join(el.get("class") or []) + " " + (el.get("id") or "")
         return bool(self._NAVISH_RE.search(haystack))
 
+    # Anker für ID-basierte Haupt-Container (ganze ID = einer dieser Begriffe,
+    # ggf. mit -content-Suffix): #content, #main, #main-content, #primary …
+    _CONTENT_ID_RE = re.compile(
+        r"^(content|main|primary|page)([-_]?content)?$", re.I
+    )
+
     def _find_content_root(self, soup):
         """Findet den Haupt-Inhaltscontainer und überspringt Navigations-Elemente.
 
-        Frühere Heuristik (\\b(content|main|article)\\b) matchte fälschlich
-        Navigations-IDs wie 'gh-g-navigation--main', weil Bindestriche als
-        Wortgrenzen zählen – die <nav> wurde als Wurzel gewählt und in _node
-        sofort verworfen → leere Ausgabe.
+        Reihenfolge: starke, eindeutige Container zuerst (semantische Tags,
+        <content>-Tag, role=main, eindeutige IDs). Erst danach Klassen-Token.
+        Wichtig: Ein Klassen-Treffer darf die Seite nicht zu eng beschneiden –
+        enthält er 0 Bilder, obwohl der Body welche hat, wird auf <body>
+        zurückgefallen (sonst gingen ganze Sektionen inkl. Hero verloren).
+        _node überspringt nav/footer ohnehin.
         """
-        for tag in ("main", "article"):
-            el = soup.find(tag)
-            if el is not None:
-                return el
-        # Pro Stufe alle nicht-navigationsartigen Treffer sammeln und den
-        # textreichsten wählen (robust gegen kleine Teaser-/Zähler-Container).
+        body = soup.body or soup
+
+        # 1) Starke, eindeutige Container.
+        strong = (
+            soup.find("main")
+            or soup.find(attrs={"role": "main"})
+            or soup.find("article")
+            or soup.find("content")          # eigenes Wrapper-Tag (z. B. GREYHOUND-Seiten)
+            or soup.find(id=self._CONTENT_ID_RE)
+        )
+        if strong is not None and not self._is_navish(strong):
+            return strong
+
+        # 2) Klassen-Token gestaffelt; je Stufe den Treffer mit den meisten
+        #    Bildern wählen (Tie-Break: meiste Textlänge) – nicht ein Text-Leaf.
+        body_imgs = len(body.find_all("img"))
         for pattern in self._CONTENT_TIERS:
-            matches = []
-            seen = set()
-            for el in soup.find_all(class_=pattern) + soup.find_all(id=pattern):
-                if id(el) in seen or self._is_navish(el):
-                    continue
-                seen.add(id(el))
-                matches.append(el)
-            if matches:
-                return max(matches, key=lambda e: len(e.get_text(strip=True)))
-        return soup.body or soup
+            matches = [el for el in soup.find_all(class_=pattern)
+                       if not self._is_navish(el)]
+            if not matches:
+                continue
+            best = max(matches, key=lambda e: (len(e.find_all("img")),
+                                               len(e.get_text(strip=True))))
+            # Sicherheitsnetz gegen Über-Einengung: verliert der Treffer alle
+            # Bilder, obwohl die Seite welche hat → lieber den ganzen Body.
+            if body_imgs and not best.find_all("img"):
+                return body
+            return best
+        return body
 
     def _to_markdown(self, html: str, img_data: dict) -> str:
         try:
@@ -1264,7 +1293,16 @@ class Scraper:
 
         self._img_data = img_data
         self._img_counter = [0]
-        self._img_total = [len(list(root.find_all("img")))]
+        root_imgs = list(root.find_all("img"))
+        if self._describe_idx is not None:
+            # Nur die nicht-gefilterten Bilder zählen (für „Bild n/total").
+            self._img_total = [sum(
+                1 for im in root_imgs
+                if (im.get("data-scraper-idx") or "").isdigit()
+                and int(im["data-scraper-idx"]) in self._describe_idx
+            )]
+        else:
+            self._img_total = [len(root_imgs)]
 
         lines: list = []
         if page_title:
@@ -1481,6 +1519,15 @@ class Scraper:
     # ── Bild-Block ────────────────────────────────────────────────────────────
 
     def _img_block(self, el, out: list, caption: str = ""):
+        # Bewusst weg­gefilterte Bilder (zu klein / Deko) erzeugen GAR KEINEN
+        # Block – sonst stünde für jedes Logo/Icon ein leerer „Bild-URL"-
+        # Platzhalter in der Ausgabe. Greift nur im Browser-Pfad, wo
+        # _describe_idx gesetzt ist; .eml-Modus (None) behält das alte Verhalten.
+        if self._describe_idx is not None:
+            sidx = el.get("data-scraper-idx")
+            if sidx is not None and sidx.isdigit() and int(sidx) not in self._describe_idx:
+                return
+
         src = (
             el.get("src")
             or el.get("data-src")
