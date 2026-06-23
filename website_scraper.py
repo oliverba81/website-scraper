@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Website Scraper → Markdown
-Extrahiert komplette Webseiten als strukturierte Markdown-Dateien.
+Website & EML Scraper
+Extrahiert Webseiten und lokale .eml-E-Mails als strukturierte
+Markdown- (auch XML-/CSV-) Dateien.
 Bilder werden per Claude (Anthropic) detailliert beschrieben.
-Unterstützt Einzel-URLs und XML-Sitemaps (inkl. Sitemap-Index, .gz).
+Unterstützt Einzel-URLs, XML-Sitemaps (inkl. Sitemap-Index, .gz)
+und .eml-Verzeichnisse mit dauerhaftem Verarbeitungs-Tracking.
 """
 
 import sys
@@ -148,7 +150,7 @@ def ensure_dependencies():
         return
 
     root = tk.Tk()
-    root.title("Erstmaliges Setup – Website Scraper")
+    root.title("Erstmaliges Setup – Website & EML Scraper")
     root.geometry("500x240")
     root.resizable(False, False)
     root.lift()
@@ -766,6 +768,26 @@ class Scraper:
         und nutzt danach dieselbe Konvertierung/Render-Logik.
         """
         self.base_url = eml_path
+
+        # ── Simulationsmodus ──────────────────────────────────────────────────
+        # Wie der Browser-Pfad (_browse): kein echtes Parsen, keine AI-Calls –
+        # nur Dummy-Inhalt mit kurzer simulierter Verarbeitungszeit.
+        if self.settings.get("simulate"):
+            self._log(f"  [SIM] Simuliere E-Mail-Verarbeitung: {Path(eml_path).name}")
+            delay = random.uniform(0.5, 1.5)
+            steps = 8
+            for i in range(steps):
+                if self._stop.is_set():
+                    return
+                time.sleep(delay / steps)
+                self._progress(10 + int(30 * (i + 1) / steps))
+            self._meta = {}
+            self._progress(42)
+            self._convert_and_write(_sim_html(Path(eml_path).name), {},
+                                    output_path, output_format)
+            return
+        # ──────────────────────────────────────────────────────────────────────
+
         self._log(f"Lese E-Mail: {Path(eml_path).name}")
         self._progress(10)
 
@@ -2391,7 +2413,7 @@ if __name__ == "__main__":
     class App(ctk.CTk):
         def __init__(self):
             super().__init__()
-            self.title(f"Website Scraper → Markdown  v{APP_VERSION}")
+            self.title(f"Website & EML Scraper  v{APP_VERSION}")
             self.geometry("920x720")
             self.update_idletasks()
             x = (self.winfo_screenwidth()  - 920) // 2
@@ -2415,12 +2437,12 @@ if __name__ == "__main__":
             hdr.columnconfigure(0, weight=1)
 
             ctk.CTkLabel(
-                hdr, text="🌐  Website Scraper → Markdown",
+                hdr, text="🌐  Website & EML Scraper",
                 font=ctk.CTkFont(size=20, weight="bold"), anchor="w",
             ).grid(row=0, column=0, sticky="w", padx=22, pady=(14, 2))
             ctk.CTkLabel(
                 hdr,
-                text="Extrahiert Webseiten vollständig als strukturierte Markdown-Dateien",
+                text="Extrahiert Webseiten und E-Mails als strukturierte Markdown-, XML- oder CSV-Dateien",
                 font=ctk.CTkFont(size=12), text_color="gray55", anchor="w",
             ).grid(row=1, column=0, sticky="w", padx=22, pady=(0, 14))
             ctk.CTkButton(
