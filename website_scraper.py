@@ -31,7 +31,7 @@ from xml.etree import ElementTree as ET
 # ─── Konstanten ──────────────────────────────────────────────────────────────
 
 APP_NAME    = "website_scraper"
-APP_VERSION = "1.0.24"
+APP_VERSION = "1.0.25"
 SETTINGS_FILE = Path.home() / f".{APP_NAME}_settings.json"
 
 GITHUB_REPO     = "oliverba81/website-scraper"
