@@ -1067,18 +1067,36 @@ class Scraper:
                     # SVGs werden NICHT mehr ausgeschlossen – sie können nicht direkt
                     # an die Vision-API gehen, werden aber in _download_image per
                     # Element-Screenshot zu PNG gerendert.
-                    candidates, deco_skipped = [], 0
+                    # Pro Bild eine nachvollziehbare Entscheidung loggen.
+                    self._log(f"Bild-Auswahl ({len(img_infos)} img-Elemente · "
+                              f"Mindestgröße {min_describe}px"
+                              + (" · Deko-Filter an" if skip_deco else "") + "):")
+                    candidates = []
+                    deco_skipped = size_skipped = 0
                     for info in img_infos:
-                        if not (info["src"] and info["width"] >= 30
-                                and info["height"] >= 30
-                                and _describe_size(info) >= min_describe):
+                        idx = info.get("idx", -1)
+                        fn  = (info.get("src", "") or "").rsplit("/", 1)[-1][:42]
+                        ds  = _describe_size(info)
+                        if not info["src"]:
+                            self._log(f"  • #{idx} {fn or '(ohne Quelle)'} → übersprungen (keine Bildquelle / nicht geladen)")
+                            continue
+                        if info["width"] < 30 or info["height"] < 30:
+                            self._log(f"  • #{idx} {fn} ({ds}px) → übersprungen (zu klein, < 30px)")
+                            size_skipped += 1
+                            continue
+                        if ds < min_describe:
+                            self._log(f"  • #{idx} {fn} ({ds}px) → übersprungen (unter Mindestgröße {min_describe}px)")
+                            size_skipped += 1
                             continue
                         if skip_deco and self._is_decorative(info):
+                            self._log(f"  • #{idx} {fn} ({ds}px) → übersprungen (Deko: Logo/Icon)")
                             deco_skipped += 1
                             continue
-                        candidates.append(info)
                         if len(candidates) >= max_imgs:
-                            break
+                            self._log(f"  • #{idx} {fn} ({ds}px) → übersprungen (Max. Bilder {max_imgs} erreicht)")
+                            continue
+                        candidates.append(info)
+                        self._log(f"  • #{idx} {fn} ({ds}px) → wird beschrieben")
 
                     # Nur diese Bilder sollen in der Ausgabe erscheinen; alle
                     # anderen <img> werden in _img_block komplett übersprungen
@@ -1086,10 +1104,8 @@ class Scraper:
                     self._describe_idx = {info["idx"] for info in candidates}
 
                     total = len(candidates)
-                    incomplete = sum(1 for i in img_infos if not i.get("complete", True) and i["src"])
-                    skip_info = f" · {incomplete} noch nicht fertig geladen" if incomplete else ""
-                    deco_info = f" · {deco_skipped} Deko (Logo/Icon) übersprungen" if deco_skipped else ""
-                    self._log(f"Lade {total} Bilder… (von {len(img_infos)} img-Elementen{skip_info}{deco_info})")
+                    self._log(f"→ {total} von {len(img_infos)} Bildern werden beschrieben "
+                              f"({size_skipped} zu klein, {deco_skipped} Deko).")
 
                     for i, info in enumerate(candidates):
                         if self._stop.is_set():
