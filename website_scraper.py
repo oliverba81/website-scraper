@@ -2498,23 +2498,24 @@ if __name__ == "__main__":
                 text_color=("#1a7a42", "#2ecc86"), anchor="w",
             ).pack(padx=14, pady=10, fill="x")
 
-            # Spalten: (Überschrift, Ausrichtung, Mindestbreite px, dehnbar?)
+            # Spalten: (Überschrift, Ausrichtung, Mindestbreite px, Dehn-Gewicht)
+            # Das Gewicht verteilt den freien Platz proportional – so bekommt
+            # Datum nicht mehr den gesamten Überschuss.
             self._cols = [
-                ("Datum",   "w", 140, True),
-                ("Modus",   "w",  78, False),
-                ("Seiten",  "e",  60, False),
-                ("Manuell", "e", 120, False),
-                ("Tool",    "e", 120, False),
-                ("Gespart", "e", 120, False),
-                ("%",       "e",  58, False),
+                ("Datum",   "w", 150, 3),
+                ("Modus",   "w",  80, 1),
+                ("Seiten",  "e",  62, 1),
+                ("Manuell", "e", 130, 2),
+                ("Tool",    "e", 120, 2),
+                ("Gespart", "e", 130, 2),
+                ("%",       "e",  60, 1),
             ]
             self._table = ctk.CTkScrollableFrame(
                 self, corner_radius=6, fg_color=("gray96", "#141420"),
             )
             self._table.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 10))
-            for c, (_, _, minw, grow) in enumerate(self._cols):
-                self._table.grid_columnconfigure(
-                    c, minsize=minw, weight=(1 if grow else 0))
+            for c, (_, _, minw, weight) in enumerate(self._cols):
+                self._table.grid_columnconfigure(c, minsize=minw, weight=weight)
 
         def _add_row(self, r, values, header=False, zebra=False):
             bg = "transparent"
