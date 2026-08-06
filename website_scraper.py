@@ -2498,16 +2498,41 @@ if __name__ == "__main__":
                 text_color=("#1a7a42", "#2ecc86"), anchor="w",
             ).pack(padx=14, pady=10, fill="x")
 
-            self._log_box = ctk.CTkTextbox(
-                self,
-                font=ctk.CTkFont(family="Consolas", size=10),
-                fg_color=("gray96", "#141420"),
-                text_color=("gray10", "#d4d4d4"),
-                corner_radius=6,
-                state="disabled",
+            # Spalten: (Überschrift, Ausrichtung, Mindestbreite px, Dehn-Gewicht)
+            # Das Gewicht verteilt den freien Platz proportional – so bekommt
+            # Datum nicht mehr den gesamten Überschuss.
+            self._cols = [
+                ("Datum",   "w", 150, 3),
+                ("Modus",   "w",  80, 1),
+                ("Seiten",  "e",  62, 1),
+                ("Manuell", "e", 130, 2),
+                ("Tool",    "e", 120, 2),
+                ("Gespart", "e", 130, 2),
+                ("%",       "e",  60, 1),
+            ]
+            self._table = ctk.CTkScrollableFrame(
+                self, corner_radius=6, fg_color=("gray96", "#141420"),
             )
-            self._log_box.grid(row=2, column=0, sticky="nsew",
-                                padx=16, pady=(0, 10))
+            self._table.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 10))
+            for c, (_, _, minw, weight) in enumerate(self._cols):
+                self._table.grid_columnconfigure(c, minsize=minw, weight=weight)
+
+        def _add_row(self, r, values, header=False, zebra=False):
+            bg = "transparent"
+            if header:
+                bg = ("#e4e7ec", "#20202e")
+            elif zebra:
+                bg = ("gray92", "#1b1b28")
+            font = ctk.CTkFont(size=11, weight="bold" if header else "normal",
+                               family=None if header else "Consolas")
+            for c, (_, anchor, _, _) in enumerate(self._cols):
+                ctk.CTkLabel(
+                    self._table, text=("  " + values[c]) if anchor == "w"
+                                       else (values[c] + "  "),
+                    anchor=anchor, font=font, height=26,
+                    fg_color=bg, corner_radius=0,
+                    text_color=("gray10", "#d4d4d4"),
+                ).grid(row=r, column=c, sticky="nsew", padx=0, pady=0)
 
             btn_row = ctk.CTkFrame(self, fg_color="transparent")
             btn_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
@@ -2541,28 +2566,27 @@ if __name__ == "__main__":
             else:
                 self._total_var.set("Noch keine Läufe gespeichert.")
 
-            header = (
-                f"{'Datum':<18}{'Modus':<10}{'Seiten':>7}  "
-                f"{'Manuell':<14}{'Tool':<12}Gespart\n"
-                + "─" * 78 + "\n"
-            )
-            lines = [header]
-            for run in reversed(runs):
+            # Tabelle neu aufbauen
+            for w in self._table.winfo_children():
+                w.destroy()
+            self._add_row(0, [h for h, _, _, _ in self._cols], header=True)
+            if not runs:
+                ctk.CTkLabel(self._table, text="Noch keine Läufe.",
+                             text_color="gray55").grid(
+                    row=1, column=0, columnspan=len(self._cols),
+                    sticky="w", padx=8, pady=8)
+                return
+            for i, run in enumerate(reversed(runs), start=1):
                 mode_lbl = "Sitemap" if run.get("mode") == "sitemap" else "Einzeln"
-                line = (
-                    f"{run.get('date', ''):<18}{mode_lbl:<10}"
-                    f"{run.get('pages', 1):>7}  "
-                    f"~{_fmt_min(run.get('human_min', 0)):<13}"
-                    f"{_fmt_min(run.get('tool_min', 0)):<12}"
-                    f"{_fmt_min(run.get('saved_min', 0))}  "
-                    f"({run.get('pct', 0)} %)\n"
-                )
-                lines.append(line)
-
-            self._log_box.configure(state="normal")
-            self._log_box.delete("1.0", tk.END)
-            self._log_box.insert("1.0", "".join(lines))
-            self._log_box.configure(state="disabled")
+                self._add_row(i, [
+                    run.get("date", ""),
+                    mode_lbl,
+                    str(run.get("pages", 1)),
+                    "~" + _fmt_min(run.get("human_min", 0)),
+                    _fmt_min(run.get("tool_min", 0)),
+                    _fmt_min(run.get("saved_min", 0)),
+                    f"{run.get('pct', 0)} %",
+                ], zebra=(i % 2 == 0))
 
         def _reset(self):
             if _askyn(self, "Statistik zurücksetzen",
